@@ -1,0 +1,21 @@
+[package]
+name = "venice-x402-route"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+alloy-dyn-abi = { version = "1.6", features = ["eip712"] }
+# Exact-pinned: alloy-dyn-abi's EIP-712 hashing depends on the exact
+# alloy-primitives version for type encoding compatibility. A patch
+# release could change the encoding and silently invalidate signing hashes.
+alloy-primitives = { version = "=1.6.1", default-features = false, features = ["std"] }
+base64 = "0.22"
+hex = "0.4"
+petal = { package = "bloom-petal-sdk", git = "https://github.com/bloom-directory/petal", rev = "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha3 = "0.10"

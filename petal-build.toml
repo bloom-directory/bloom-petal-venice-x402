@@ -1,0 +1,14 @@
+schema = "bloom.petal.build.v1"
+
+[route]
+crate = "venice-x402-route"
+crate_path = "route"
+
+[route.dependencies]
+# EIP-712 typed-data hashing for EIP-3009 payment authorization.
+# Pinned: a patch release could change encoding and silently break signatures.
+alloy-dyn-abi = "1.6"
+alloy-primitives = "1.6"
+base64 = "0.22"
+hex = "0.4"
+sha3 = "0.10"

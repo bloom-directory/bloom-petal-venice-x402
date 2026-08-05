@@ -1,0 +1,31 @@
+schema = "bloom.petal.package.v1"
+name = "venice-x402"
+
+[source]
+kind = "github"
+repository = "bloom-directory/bloom-petal-venice-x402"
+
+[consent]
+summary = "Pay-per-request private AI inference via Venice's x402 protocol: authenticate with SIWE on Base, top up with USDC via EIP-3009, and call Venice chat completions. The wallet signs a SIWE message and an EIP-3009 payment authorization — no API key required."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:sign", "bloom:vfs.read"]
+
+[[net.allow]]
+binding = "venice"
+host = "api.venice.ai"
+methods = ["get", "post"]
+paths = [
+    "/api/v1/models",
+    "/api/v1/chat/completions",
+    "/api/v1/x402/balance",
+    "/api/v1/x402/top-up",
+    "/api/v1/x402/transactions",
+]
+
+[sign]
+allowed_intents = ["venice-x402.siwe", "venice-x402.topup", "venice-x402.chat"]
+
+[store]
+namespaces = ["state"]
+secret_namespaces = ["secrets"]

@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "audit-fixes"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Format check
+        run: cargo fmt --check --manifest-path route/Cargo.toml
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --manifest-path route/Cargo.toml -- -D warnings
+
+      - name: Architecture check
+        run: bash scripts/check-route-architecture.sh
+
+      - name: Tests
+        run: cargo test --manifest-path route/Cargo.toml

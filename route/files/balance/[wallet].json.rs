@@ -1,0 +1,20 @@
+petal::route_file!(
+    spec: petal::store_read_spec(),
+    read: |ctx: &petal::Ctx| {
+        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
+            if petal::is_safe_segment(value) && value.len() <= 128 {
+                Ok(value)
+            } else {
+                Err(petal::error(-3, "wallet alias is unsafe"))
+            }
+        }) {
+            Ok(wallet) => wallet,
+            Err(response) => return response,
+        };
+        let address = match crate::wallet_address(wallet) {
+            Ok(address) => address,
+            Err(response) => return response,
+        };
+        crate::venice_balance(wallet, &address)
+    }
+);
