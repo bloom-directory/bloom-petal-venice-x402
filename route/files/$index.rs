@@ -1,4 +1,10 @@
 petal::route_file!(
     spec: petal::static_dir_spec(),
-    fallible_list: Ok(petal::dir_names(&["models.json", "status.json"]))
+    list: vec![
+        petal::dir("balance"),
+        petal::dir("chat"),
+        petal::dir("topup"),
+        petal::file("models.json"),
+        petal::file("status.json"),
+    ]
 );

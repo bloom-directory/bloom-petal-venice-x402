@@ -16,8 +16,8 @@ petal::route_file!(
             Ok(wallet) => wallet,
             Err(response) => return response,
         };
-        let key = crate::venice::topup_store_key(wallet);
-        petal::read_store(&key, crate::common::MAX_STORED)
+        let key = crate::topup_store_key(wallet);
+        petal::read_store(&key, crate::MAX_STORED)
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
         if body.len() > 4 * 1024 {
@@ -41,7 +41,7 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
         };
-        if !crate::common::is_evm_address(&request.address) {
+        if !crate::is_evm_address(&request.address) {
             return petal::error(-3, "address must be a valid EVM address");
         }
         crate::venice_topup(&wallet, &address, request)

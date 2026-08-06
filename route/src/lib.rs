@@ -10,11 +10,12 @@ mod types;
 pub mod venice;
 mod x402;
 
+pub use common::{MAX_STORED, is_evm_address};
 pub use serde_json;
 pub use types::{
     BalanceView, ChatMessage, ChatRequest, StoredChat, StoredTopUp, TokenUsage, TopUpRequest,
 };
-pub use venice::{parse_chat_request, parse_topup_request};
+pub use venice::{chat_store_key, parse_chat_request, parse_topup_request, topup_store_key};
 
 /// Resolve a wallet alias to its EVM address via VFS.
 pub fn wallet_address(wallet: &str) -> Result<String, petal::DispatchResponse> {

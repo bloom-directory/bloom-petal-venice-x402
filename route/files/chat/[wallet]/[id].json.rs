@@ -26,8 +26,8 @@ petal::route_file!(
             Ok(id) => id,
             Err(response) => return response,
         };
-        let key = crate::venice::chat_store_key(wallet, id);
-        petal::read_store(&key, crate::common::MAX_STORED)
+        let key = crate::chat_store_key(wallet, id);
+        petal::read_store(&key, crate::MAX_STORED)
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
         if body.len() > 64 * 1024 {
