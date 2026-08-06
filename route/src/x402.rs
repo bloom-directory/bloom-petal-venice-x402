@@ -156,20 +156,32 @@ pub(crate) fn eip712_signing_hash(
 /// Extract a USDC-on-Base payment requirement from a 402 response.
 ///
 /// Venice supports multiple payment options (Base, Solana). We only support
-/// USDC on Base (EIP-3009).
+/// USDC on Base (EIP-3009). Venice sends networks as CAIP-2 IDs
+/// (`eip155:8453` for Base mainnet); `is_base_mainnet` mirrors the canonical
+/// Venice x402 client's `normalizePaymentNetwork`, and the `asset` check
+/// pins native USDC on Base.
 pub(crate) fn extract_base_requirement(
     required: &PaymentRequired,
 ) -> Result<&PaymentRequirement, DispatchResponse> {
     required
         .accepts
         .iter()
-        .find(|req| req.network == "base" && req.asset.eq_ignore_ascii_case(USDC_BASE))
+        .find(|req| is_base_mainnet(&req.network) && req.asset.eq_ignore_ascii_case(USDC_BASE))
         .ok_or_else(|| {
             common::backend(
                 "Venice 402 response did not include a USDC-on-Base payment option; \
                  only EIP-3009 USDC on Base is supported",
             )
         })
+}
+
+/// Returns true for a Base mainnet network identifier. Mirrors Venice's
+/// canonical x402 client (`normalizePaymentNetwork`): Sepolia variants are
+/// excluded, everything else is treated as Base mainnet. The asset check in
+/// the caller pins native USDC, so Solana/Sepolia options are filtered there.
+fn is_base_mainnet(network: &str) -> bool {
+    let n = network.trim().to_ascii_lowercase();
+    !(n == "base-sepolia" || n == "eip155:84532")
 }
 
 /// Build and sign an x402 payment header for a top-up.
@@ -272,7 +284,8 @@ mod tests {
     fn base_requirement() -> PaymentRequirement {
         PaymentRequirement {
             scheme: "exact".into(),
-            network: "base".into(),
+            // Venice sends CAIP-2 mainnet IDs; Base is `eip155:8453`.
+            network: "eip155:8453".into(),
             asset: USDC_BASE.into(),
             amount: "5000000".into(),
             pay_to: VENICE_PAYEE.into(),
@@ -354,12 +367,12 @@ mod tests {
             accepts: vec![
                 PaymentRequirement {
                     scheme: "exact".into(),
-                    network: "solana".into(),
+                    network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".into(),
                     asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
                     amount: "5000000".into(),
-                    pay_to: "solana_address".into(),
+                    pay_to: "8qUL23aSj7mDWdoLMXGHFvnVCT9wd7jXcysiekroADEL".into(),
                     max_timeout_seconds: 300,
-                    extra: json!({}),
+                    extra: json!({"name": "USD Coin", "version": "2", "feePayer": "..."}),
                 },
                 base_requirement(),
             ],
@@ -367,7 +380,8 @@ mod tests {
 
         let result = extract_base_requirement(&required);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().network, "base");
+        // Returns the Base mainnet option (CAIP-2 eip155:8453), not Solana.
+        assert_eq!(result.unwrap().network, "eip155:8453");
     }
 
     #[test]
@@ -382,16 +396,16 @@ mod tests {
 
     #[test]
     fn parses_realistic_venice_402_body() {
-        // Venice (and the x402 spec) serialize the 402 body with camelCase
-        // keys: x402Version / payTo / maxTimeoutSeconds. A regression to
-        // snake_case here would silently break the entire top-up flow against
-        // live Venice. The `extra` field is optional in the spec.
+        // The EXACT shape Venice returns live (captured via curl against
+        // api.venice.ai): camelCase keys, CAIP-2 networks (`eip155:8453` for
+        // Base mainnet, `solana:5eykt4...` for Solana), Solana carrying an
+        // optional `feePayer`. A regression to snake_case or to matching
+        // `network == "base"` would silently break the whole top-up flow.
         let body = serde_json::to_vec(&json!({
             "x402Version": 2,
-            "error": "insufficient_balance",
             "accepts": [{
                 "scheme": "exact",
-                "network": "base",
+                "network": "eip155:8453",
                 "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
                 "amount": "5000000",
                 "payTo": "0x2670b922ef37c7df47158725c0cc407b5382293f",
@@ -399,11 +413,12 @@ mod tests {
                 "extra": {"name": "USD Coin", "version": "2"}
             }, {
                 "scheme": "exact",
-                "network": "solana",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
                 "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                 "amount": "5000000",
-                "payTo": "solana_payee",
-                "maxTimeoutSeconds": 300
+                "payTo": "8qUL23aSj7mDWdoLMXGHFvnVCT9wd7jXcysiekroADEL",
+                "maxTimeoutSeconds": 300,
+                "extra": {"name": "USD Coin", "version": "2", "feePayer": "BFK9TLC3edb13K6v4YyH3DwPb5DSUpkWvb7XnqCL9b4F"}
             }]
         }))
         .unwrap();
@@ -411,7 +426,7 @@ mod tests {
         assert_eq!(required.x402_version, 2);
         assert_eq!(required.accepts.len(), 2);
         let base = extract_base_requirement(&required).unwrap();
-        assert_eq!(base.network, "base");
+        assert_eq!(base.network, "eip155:8453");
         assert_eq!(base.pay_to, "0x2670b922ef37c7df47158725c0cc407b5382293f");
         assert_eq!(base.max_timeout_seconds, 300);
     }
@@ -440,7 +455,7 @@ mod tests {
 
         assert_eq!(payload["x402Version"], 2);
         assert_eq!(payload["scheme"], "exact");
-        assert_eq!(payload["network"], "base");
+        assert_eq!(payload["network"], "eip155:8453");
         assert_eq!(payload["payload"]["authorization"]["from"], ADDRESS);
         assert_eq!(payload["payload"]["authorization"]["to"], VENICE_PAYEE);
         // The paid value is the CALLER's amount, not the requirement minimum.
@@ -583,7 +598,7 @@ mod tests {
         // Top-level canonical keys.
         assert_eq!(payload["x402Version"], 2);
         assert_eq!(payload["scheme"], "exact");
-        assert_eq!(payload["network"], "base");
+        assert_eq!(payload["network"], "eip155:8453");
         // No snake_case leakage anywhere in the wire object.
         let wire = serde_json::to_string(&payload).unwrap();
         assert!(
