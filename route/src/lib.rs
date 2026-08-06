@@ -4,10 +4,10 @@
 //! with SIWE, top up with USDC on Base via EIP-3009, and call any Venice
 //! inference endpoint.
 
-mod common;
+pub mod common;
 mod siwe;
 mod types;
-mod venice;
+pub mod venice;
 mod x402;
 
 pub use serde_json;

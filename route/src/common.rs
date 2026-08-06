@@ -48,7 +48,7 @@ pub(crate) const MAX_BODY: usize = 512 * 1024;
 /// long — can always be written and read back. The previous 32 KB cap would
 /// silently fail the read-back (after the user had already paid for the
 /// inference) on any sizable model response.
-pub(crate) const MAX_STORED: usize = 1024 * 1024;
+pub const MAX_STORED: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Host trait
@@ -123,7 +123,7 @@ pub(crate) fn backend(message: impl Into<String>) -> DispatchResponse {
 // ---------------------------------------------------------------------------
 
 /// Validate an EVM address (0x-prefixed, 40 hex digits, case-insensitive).
-pub(crate) fn is_evm_address(value: &str) -> bool {
+pub fn is_evm_address(value: &str) -> bool {
     value.len() == 42
         && value.starts_with("0x")
         && value[2..].bytes().all(|b| b.is_ascii_hexdigit())

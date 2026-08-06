@@ -1,6 +1,6 @@
 petal::route_file!(
     spec: petal::static_read_spec(),
-    read: |_ctx: &petal::Ctx| petal::read_json_value(&serde_json::json!({
+    read: |_ctx: &petal::Ctx| petal::read_json_value(&crate::serde_json::json!({
         "petal": "venice-x402",
         "status": "ok",
         "description": "Private AI inference via Venice's x402 payment protocol. Authenticate with SIWE, top up with USDC on Base via EIP-3009, and call Venice inference endpoints.",

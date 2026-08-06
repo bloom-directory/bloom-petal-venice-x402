@@ -1,10 +1,20 @@
 schema = "bloom.petal.build.v1"
+name = "venice-x402"
+routes = "route/files"
+output = "petal/venice-x402"
 
-[route]
-crate = "venice-x402-route"
-crate_path = "route"
+[route_crate]
+package = "venice-x402-route"
+path = "route"
+alias = "venice_x402_route"
 
-[route.dependencies]
+# Pinned to the exact SDK rev the route crate is written against.
+[sdk]
+package = "bloom-petal-sdk"
+git = "https://github.com/bloom-directory/petal"
+rev = "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd"
+
+[dependencies]
 # EIP-712 typed-data hashing for EIP-3009 payment authorization.
 # Pinned: a patch release could change encoding and silently break signatures.
 alloy-dyn-abi = "1.6"

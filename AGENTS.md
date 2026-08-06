@@ -9,9 +9,13 @@ cargo test --manifest-path route/Cargo.toml         # 64 tests (48 unit + 16 int
 cargo clippy --all-targets --manifest-path route/Cargo.toml -- -D warnings
 cargo fmt --manifest-path route/Cargo.toml --check
 bash scripts/check-route-architecture.sh
+bash scripts/build-petal.sh                          # compiles route files → wasm (CI gate)
 ```
 
-All four must pass before pushing. CI runs them on every PR.
+All five must pass before pushing. `cargo test` alone does NOT compile the
+route files (each is built as its own crate by the petal builder), so
+`scripts/build-petal.sh` is the only check that catches route-file compile
+errors and a stale `petal-build.toml`. CI runs all five on every PR.
 
 ## Architecture Rules
 

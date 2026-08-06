@@ -1,3 +1,6 @@
 /target
 /route/target
 *.wasm
+# petal build outputs
+/petal
+/artifacts
