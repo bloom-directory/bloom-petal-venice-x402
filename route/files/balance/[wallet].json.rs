@@ -1,5 +1,10 @@
 petal::route_file!(
-    spec: petal::store_read_spec(),
+    spec: petal::store_read_spec().caps(&[
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:vfs.read",
+    ]),
     read: |ctx: &petal::Ctx| {
         let wallet = match petal::param(ctx, "wallet").and_then(|value| {
             if petal::is_safe_segment(value) && value.len() <= 128 {

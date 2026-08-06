@@ -21,10 +21,11 @@ fn authed_get<H: Host>(
     address: &str,
     path: &str,
 ) -> Result<Value, DispatchResponse> {
-    let session = siwe::get_or_create_session(host, wallet, address)?;
+    let url = format!("{VENICE_API}{path}");
+    let session = siwe::get_or_create_session(host, wallet, address, &url)?;
     let request = petal::HttpRequest {
         method: "GET".into(),
-        url: format!("{VENICE_API}{path}"),
+        url,
         headers: vec![
             ("accept".into(), "application/json".into()),
             ("X-Sign-In-With-X".into(), session.header_b64.clone()),
@@ -110,61 +111,83 @@ pub(crate) fn check_balance<H: Host>(
     let view = BalanceView {
         wallet: wallet.to_string(),
         address: address.to_string(),
-        can_consume: value
-            .get("canConsume")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        balance_usd: value
-            .get("balanceUsd")
-            .and_then(Value::as_str)
-            .unwrap_or("0")
-            .to_string(),
-        diem_balance_usd: value
-            .get("diemBalanceUsd")
-            .and_then(Value::as_str)
-            .map(String::from),
-        minimum_top_up_usd: value
-            .get("minimumTopUpUsd")
-            .and_then(Value::as_str)
-            .map(String::from),
-        suggested_top_up_usd: value
-            .get("suggestedTopUpUsd")
-            .and_then(Value::as_str)
-            .map(String::from),
+        can_consume: field_bool(&value, "canConsume").unwrap_or(false),
+        balance_usd: field_string(&value, "balanceUsd").unwrap_or_else(|| "0".into()),
+        diem_balance_usd: field_string(&value, "diemBalanceUsd"),
+        minimum_top_up_usd: field_string(&value, "minimumTopUpUsd"),
+        suggested_top_up_usd: field_string(&value, "suggestedTopUpUsd"),
     };
     Ok(view)
+}
+
+/// Read a field from a Venice response, tolerating both a top-level placement
+/// and a `{data: {...}}` envelope. The Venice docs describe top-level fields
+/// while the canonical x402 client reads from `data`; accepting both makes the
+/// petal robust to either shape without a live probe.
+fn field_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .get(key)
+        .or_else(|| value.get("data").and_then(|d| d.get(key)))
+}
+
+/// Read a boolean field (top-level or under `data`).
+fn field_bool(value: &Value, key: &str) -> Option<bool> {
+    field_value(value, key).and_then(Value::as_bool)
+}
+
+/// Read a field as a string, coercing numbers (Venice sometimes returns
+/// balances as JSON numbers). Top-level or under `data`.
+fn field_string(value: &Value, key: &str) -> Option<String> {
+    let v = field_value(value, key)?;
+    v.as_str()
+        .map(str::to_string)
+        .or_else(|| v.as_f64().map(format_balance_number))
+}
+
+/// Format a JSON-number balance as a tidy decimal string (e.g. 9.87, 10, 0.5).
+fn format_balance_number(n: f64) -> String {
+    if n == n.trunc() {
+        format!("{n:.0}")
+    } else {
+        // Trim trailing zeros from a fixed 6-decimal render.
+        format!("{n:.6}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
 }
 
 /// Perform an x402 top-up with USDC on Base.
 ///
 /// Flow:
 /// 1. POST /x402/top-up (no payment header) → 402 with payment requirements.
-/// 2. Build and sign EIP-3009 `TransferWithAuthorization`.
-/// 3. POST /x402/top-up with `X-402-Payment` header → 200 with balance.
+///    The `amount` in each requirement is the *minimum* top-up.
+/// 2. Validate the requested amount is >= that minimum.
+/// 3. Build and sign an EIP-3009 `TransferWithAuthorization` for the
+///    *requested* amount (the value actually transferred on-chain).
+/// 4. POST /x402/top-up with `X-402-Payment` header → 200 with balance.
 pub(crate) fn top_up<H: Host>(
     host: &mut H,
     wallet: &str,
     address: &str,
     amount_usd: &str,
 ) -> Result<(String, Option<String>), DispatchResponse> {
-    // Parse amount and convert to USDC base units (6 decimals).
-    let amount_f: f64 = amount_usd
-        .parse()
-        .map_err(|_| common::invalid(format!("amount_usd is not a valid number: {amount_usd}")))?;
-    if amount_f <= 0.0 {
+    // Parse the requested amount into USDC base units. This value drives the
+    // on-chain transfer, so it is computed with exact integer math, not f64.
+    let amount_base_units = common::parse_usd_to_base_units(amount_usd)
+        .map_err(|e| common::invalid(format!("{e}; amount_usd must be a decimal USD value")))?;
+    if amount_base_units == 0 {
         return Err(common::invalid("amount_usd must be positive"));
     }
-    let amount_base_units = format!("{}", (amount_f * 1e6).round() as u64);
+    let amount_base_units_str = amount_base_units.to_string();
 
     // Step 1: initiate top-up to get payment requirements.
-    let session = siwe::get_or_create_session(host, wallet, address)?;
+    // Per Venice's x402 spec the initial /x402/top-up request takes no auth
+    // header; the payment is authorized via X-402-Payment on the retry.
     let init_request = petal::HttpRequest {
         method: "POST".into(),
         url: format!("{VENICE_API}/x402/top-up"),
-        headers: vec![
-            ("content-type".into(), "application/json".into()),
-            ("X-Sign-In-With-X".into(), session.header_b64.clone()),
-        ],
+        headers: vec![("content-type".into(), "application/json".into())],
         body: serde_json::to_vec(&json!({}))
             .map_err(|e| common::backend(format!("serialize top-up body: {e}")))?,
     };
@@ -192,12 +215,35 @@ pub(crate) fn top_up<H: Host>(
         .map_err(|e| common::backend(format!("parse 402 payment requirements: {e}")))?;
     let requirement = x402::extract_base_requirement(&required)?;
 
-    // Step 2: build and sign the x402 payment header.
+    // Step 2: enforce Venice's minimum top-up. `requirement.amount` is the
+    // minimum in USDC base units (6 decimals), not the amount charged.
+    let minimum_base_units: u64 = requirement.amount.parse().map_err(|_| {
+        common::backend(format!(
+            "Venice 402 requirement has a non-numeric amount: {}",
+            requirement.amount
+        ))
+    })?;
+    if amount_base_units < minimum_base_units {
+        let minimum_usd = (minimum_base_units as f64) / 1_000_000.0;
+        return Err(common::invalid(format!(
+            "amount_usd must be at least ${minimum_usd:.2}"
+        )));
+    }
+
+    // Step 3: build and sign the x402 payment header for the requested amount.
     let now_ms = host.now_ms().map_err(common::backend)?;
     let now_secs = now_ms / 1000;
-    let payment_header = x402::build_payment_header(host, wallet, address, requirement, now_secs)?;
+    let payment_header = x402::build_payment_header(
+        host,
+        wallet,
+        address,
+        requirement,
+        &amount_base_units_str,
+        required.x402_version,
+        now_secs,
+    )?;
 
-    // Step 3: retry top-up with payment header.
+    // Step 4: retry top-up with payment header.
     let retry_request = petal::HttpRequest {
         method: "POST".into(),
         url: format!("{VENICE_API}/x402/top-up"),
@@ -219,12 +265,13 @@ pub(crate) fn top_up<H: Host>(
     }
 
     let result = common::parse_json_body(&retry_response).map_err(common::backend)?;
-    let balance_usd = result
-        .get("balanceUsd")
-        .and_then(Value::as_str)
-        .map(String::from);
+    // Venice's canonical client reads `data.newBalance` (number); some response
+    // shapes use a top-level `balanceUsd` string. Accept either so the recorded
+    // balance reflects reality regardless of the exact envelope.
+    let balance_usd =
+        field_string(&result, "balanceUsd").or_else(|| field_string(&result, "newBalance"));
 
-    Ok((amount_base_units, balance_usd))
+    Ok((amount_base_units_str, balance_usd))
 }
 
 /// Send a chat completion request.
@@ -242,18 +289,24 @@ pub(crate) fn chat_completion_raw<H: Host>(
         ));
     }
 
-    let session = siwe::get_or_create_session(host, wallet, address)?;
+    let url = format!("{VENICE_API}/chat/completions");
+    let session = siwe::get_or_create_session(host, wallet, address, &url)?;
+
+    // Venice's chat API is OpenAI-compatible: system context goes in the
+    // messages array as a {role:"system"} message, not a top-level field.
+    let mut messages: Vec<Value> = Vec::with_capacity(request.messages.len() + 1);
+    if let Some(system) = &request.system_prompt {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    for m in &request.messages {
+        messages.push(json!({"role": m.role, "content": m.content}));
+    }
 
     let mut body = json!({
         "model": request.model,
-        "messages": request.messages.iter().map(|m| {
-            json!({"role": m.role, "content": m.content})
-        }).collect::<Vec<_>>(),
+        "messages": messages,
     });
 
-    if let Some(system) = &request.system_prompt {
-        body["system_prompt"] = json!(system);
-    }
     if let Some(temp) = request.temperature {
         body["temperature"] = json!(temp);
     }
@@ -266,7 +319,7 @@ pub(crate) fn chat_completion_raw<H: Host>(
 
     let http_request = petal::HttpRequest {
         method: "POST".into(),
-        url: format!("{VENICE_API}/chat/completions"),
+        url,
         headers: vec![
             ("content-type".into(), "application/json".into()),
             ("accept".into(), "application/json".into()),
@@ -361,13 +414,9 @@ pub fn parse_topup_request(body: &[u8]) -> Result<crate::types::TopUpRequest, Di
     if request.amount_usd.is_empty() {
         return Err(common::invalid("amount_usd is required"));
     }
-    let amount: f64 = request.amount_usd.parse().map_err(|_| {
-        common::invalid(format!(
-            "amount_usd is not a valid number: {}",
-            request.amount_usd
-        ))
-    })?;
-    if amount <= 0.0 {
+    let base_units = common::parse_usd_to_base_units(&request.amount_usd)
+        .map_err(|e| common::invalid(format!("{e}; amount_usd must be a decimal USD value")))?;
+    if base_units == 0 {
         return Err(common::invalid("amount_usd must be positive"));
     }
     Ok(request)
@@ -386,6 +435,8 @@ pub fn topup_store_key(wallet: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::test_helpers::{MockHost, signature};
+    use crate::types::{ChatMessage, ChatRequest};
     use petal::HttpResponse;
 
     const ADDRESS: &str = "0x1234567890abcdef1234567890abcdef12345678";
@@ -568,5 +619,217 @@ mod tests {
             body: vec![],
         };
         assert!(extract_balance_remaining(&response).is_none());
+    }
+
+    #[test]
+    fn check_balance_parses_top_level_string_fields() {
+        // Shape described by the Venice x402 docs.
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        host.sign_results.push_back(Ok(signature())); // SIWE session
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({
+                "canConsume": true,
+                "balanceUsd": "12.50",
+                "diemBalanceUsd": "0",
+                "minimumTopUpUsd": "5.00",
+                "suggestedTopUpUsd": "10.00"
+            }))
+            .unwrap(),
+        }));
+        let view = check_balance(&mut host, "0xw", ADDRESS).unwrap();
+        assert!(view.can_consume);
+        assert_eq!(view.balance_usd, "12.50");
+        assert_eq!(view.suggested_top_up_usd.as_deref(), Some("10.00"));
+    }
+
+    #[test]
+    fn check_balance_parses_nested_data_envelope_and_numbers() {
+        // Shape the canonical Venice x402 client reads (`data.data.<field>`
+        // with numeric balances). The petal must tolerate this too.
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        host.sign_results.push_back(Ok(signature()));
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({
+                "data": {
+                    "canConsume": false,
+                    "balanceUsd": 9.87,
+                    "minimumTopUpUsd": 5.0
+                }
+            }))
+            .unwrap(),
+        }));
+        let view = check_balance(&mut host, "0xw", ADDRESS).unwrap();
+        assert!(!view.can_consume);
+        assert_eq!(view.balance_usd, "9.87");
+        assert_eq!(view.minimum_top_up_usd.as_deref(), Some("5"));
+        assert!(view.suggested_top_up_usd.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Capstone end-to-end flows (mocked Venice). These prove the integrated
+    // wiring of the payment + chat paths after the amount-semantics, SIWE
+    // URI-binding, system_prompt, and x402 wire-format fixes.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn top_up_full_flow_pays_caller_amount_and_records_balance() {
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        // Only one signature is needed: the EIP-3009 payment. The init POST
+        // takes no SIWE auth (matches the canonical Venice client).
+        host.sign_results.push_back(Ok(signature()));
+
+        // Step 1 response: 402 with a USDC-on-Base requirement (minimum $5).
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 402,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({
+                "x402Version": 2,
+                "accepts": [{
+                    "scheme": "exact",
+                    "network": "base",
+                    "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                    "amount": "5000000",
+                    "payTo": "0x2670b922ef37c7df47158725c0cc407b5382293f",
+                    "maxTimeoutSeconds": 300,
+                    "extra": {"name": "USD Coin", "version": "2"}
+                }]
+            }))
+            .unwrap(),
+        }));
+        // Step 2 response: 200 with the new balance.
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({"balanceUsd": "15.00"})).unwrap(),
+        }));
+
+        let (amount_base_units, balance_usd) =
+            top_up(&mut host, "0xwallet1", ADDRESS, "10.00").unwrap();
+
+        // Records the CALLER's amount ($10), not Venice's $5 minimum.
+        assert_eq!(amount_base_units, "10000000");
+        assert_eq!(balance_usd.as_deref(), Some("15.00"));
+        assert_eq!(host.sign_requests.len(), 1);
+        assert_eq!(host.sign_requests[0].purpose, "venice-x402.topup");
+
+        // The retry carried the X-402-Payment header; the init did not.
+        assert_eq!(host.requests.len(), 2);
+        let init = &host.requests[0];
+        let retry = &host.requests[1];
+        assert!(
+            !init
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-402-payment")),
+            "init must not carry a payment header"
+        );
+        let payment = retry
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-402-payment"))
+            .expect("retry must carry X-402-Payment");
+        assert!(!payment.1.is_empty());
+    }
+
+    #[test]
+    fn top_up_rejects_amount_below_minimum() {
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 402,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({
+                "x402Version": 2,
+                "accepts": [{
+                    "scheme": "exact",
+                    "network": "base",
+                    "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                    "amount": "5000000",
+                    "payTo": "0x2670b922ef37c7df47158725c0cc407b5382293f",
+                    "maxTimeoutSeconds": 300,
+                    "extra": {"name": "USD Coin", "version": "2"}
+                }]
+            }))
+            .unwrap(),
+        }));
+
+        let err = top_up(&mut host, "0xwallet1", ADDRESS, "1.00").unwrap_err();
+        if let petal::DispatchResponse::Error { message, .. } = err {
+            assert!(message.contains("at least $5.00"), "got: {message}");
+        } else {
+            panic!("expected error dispatch");
+        }
+        // No signing happened (validation short-circuited before payment).
+        assert!(host.sign_requests.is_empty());
+    }
+
+    #[test]
+    fn chat_full_flow_sends_system_prompt_as_message_and_reads_balance_header() {
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        host.sign_results.push_back(Ok(signature())); // SIWE session
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![("X-Balance-Remaining".into(), "9.87".into())],
+            body: serde_json::to_vec(&json!({
+                "model": "kimi-k2-5",
+                "choices": [{"message": {"role": "assistant", "content": "Hi!"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+            }))
+            .unwrap(),
+        }));
+
+        let request = ChatRequest {
+            address: ADDRESS.into(),
+            model: "kimi-k2-5".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+            system_prompt: Some("Be concise.".into()),
+            temperature: Some(0.7),
+            max_tokens: Some(128),
+            stream: false,
+        };
+
+        let (value, balance) =
+            chat_completion_raw(&mut host, "0xwallet1", ADDRESS, &request).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "Hi!");
+        assert_eq!(balance.as_deref(), Some("9.87"));
+
+        // The single Venice request carried the SIWE header...
+        assert_eq!(host.requests.len(), 1);
+        let req = &host.requests[0];
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-sign-in-with-x"))
+        );
+        // ...and the body injected the system prompt as a system message,
+        // NOT as a top-level `system_prompt` field.
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "Be concise.");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert!(body.get("system_prompt").is_none(), "got: {body}");
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["max_tokens"], 128);
     }
 }

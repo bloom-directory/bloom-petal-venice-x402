@@ -9,12 +9,13 @@ use sha3::{Digest, Keccak256};
 
 use crate::common::{
     self, CHAIN_ID, DispatchResponse, Host, MAX_STORED, SIWE_RENEWAL_SECS, SIWE_STATEMENT,
-    SIWE_TTL_SECS, VENICE_API, VENICE_DOMAIN,
+    SIWE_TTL_SECS, VENICE_DOMAIN,
 };
 
 /// Parameters for constructing a SIWE message.
 pub(crate) struct SiweParams {
     pub address: String,
+    pub uri: String,
     pub nonce: String,
     pub issued_at_iso: String,
     pub expiration_iso: String,
@@ -36,12 +37,17 @@ pub(crate) struct SiweSession {
 }
 
 /// The decoded SIWE header payload (Base64-decoded JSON).
+///
+/// Field names match Venice's canonical x402 client wire format
+/// (`chainId`, camelCase); `message` and `signature` are the EIP-191 pair
+/// Venice verifies, the remaining fields are advisory.
 #[derive(Clone, Debug, Serialize)]
 struct SiweHeaderPayload {
     address: String,
     message: String,
     signature: String,
     timestamp: u64,
+    #[serde(rename = "chainId")]
     chain_id: u64,
 }
 
@@ -54,7 +60,7 @@ struct SiweHeaderPayload {
 ///
 /// Sign in to Venice AI
 ///
-/// URI: https://api.venice.ai/api/v1/chat/completions
+/// URI: <resource URL the session is bound to>
 /// Version: 1
 /// Chain ID: 8453
 /// Nonce: <hex>
@@ -62,7 +68,6 @@ struct SiweHeaderPayload {
 /// Expiration Time: <ISO 8601>
 /// ```
 pub(crate) fn format_message(params: &SiweParams) -> String {
-    let uri = format!("{VENICE_API}/chat/completions");
     format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
          {address}\n\
@@ -78,7 +83,7 @@ pub(crate) fn format_message(params: &SiweParams) -> String {
         domain = VENICE_DOMAIN,
         address = params.address,
         statement = SIWE_STATEMENT,
-        uri = uri,
+        uri = params.uri,
         chain_id = CHAIN_ID,
         nonce = params.nonce,
         issued_at = params.issued_at_iso,
@@ -158,16 +163,22 @@ fn generate_nonce(host: &mut impl Host) -> Result<String, String> {
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
-/// Get a valid SIWE session for the wallet, creating a new one if needed.
+/// Get a valid SIWE session for `wallet` bound to `resource_url`, creating a
+/// new one if needed.
 ///
-/// Sessions are cached in the secrets store. A session is reused if it has
-/// more than `SIWE_RENEWAL_SECS` seconds of validity remaining.
+/// The SIWE `URI` is bound to the resource URL (matching Venice's canonical
+/// x402 client, which signs per-request with the actual endpoint URL).
+/// Sessions are cached per `(wallet, resource_url)` in the secrets store and
+/// reused while they have more than `SIWE_RENEWAL_SECS` seconds of validity
+/// remaining. This keeps the URI correct per endpoint without forcing a fresh
+/// wallet signature on every request.
 pub(crate) fn get_or_create_session(
     host: &mut impl Host,
     wallet: &str,
     address: &str,
+    resource_url: &str,
 ) -> Result<SiweSession, DispatchResponse> {
-    let key = session_key(wallet);
+    let key = session_key(wallet, resource_url);
 
     // Try to load and validate an existing session.
     if let Some(session) = load_cached_session(host, &key)? {
@@ -183,6 +194,7 @@ pub(crate) fn get_or_create_session(
 
     let message = format_message(&SiweParams {
         address: address.to_owned(),
+        uri: resource_url.to_owned(),
         nonce: nonce.clone(),
         issued_at_iso: issued_iso,
         expiration_iso: expiration_iso.clone(),
@@ -193,7 +205,7 @@ pub(crate) fn get_or_create_session(
         .sign_hash(&petal::SignRequest {
             wallet: wallet.to_owned(),
             hash32: hash,
-            purpose: "venice.siwe".into(),
+            purpose: "venice-x402.siwe".into(),
         })
         .map_err(common::backend)?;
 
@@ -245,8 +257,14 @@ fn load_cached_session(
     Ok((age_secs < SIWE_RENEWAL_SECS).then_some(session))
 }
 
-fn session_key(wallet: &str) -> String {
-    format!("venice-x402/sessions/{wallet}")
+fn session_key(wallet: &str, resource_url: &str) -> String {
+    // Bucket the cached session by resource URL so each endpoint (balance,
+    // chat, ...) gets its own correctly URI-bound session. Keccak256 is
+    // available in-module; a short digest is plenty for endpoint bucketing.
+    let mut hasher = Keccak256::new();
+    hasher.update(resource_url.as_bytes());
+    let slug = hex::encode(&hasher.finalize()[..8]);
+    format!("venice-x402/sessions/{wallet}/{slug}")
 }
 
 #[cfg(test)]
@@ -258,6 +276,7 @@ mod tests {
     fn siwe_message_format() {
         let params = SiweParams {
             address: "0x1234567890abcdef1234567890abcdef12345678".into(),
+            uri: "https://api.venice.ai/api/v1/chat/completions".into(),
             nonce: "0xabc123".into(),
             issued_at_iso: "2024-01-01T00:00:00.000Z".into(),
             expiration_iso: "2024-01-01T00:05:00.000Z".into(),
@@ -280,7 +299,6 @@ mod tests {
         let h2 = eip191_signing_hash("");
         assert_eq!(h1, h2);
     }
-
     #[test]
     fn eip191_hash_is_deterministic_and_varies_by_input() {
         let h1 = eip191_signing_hash("hello");
@@ -305,6 +323,54 @@ mod tests {
     }
 
     #[test]
+    fn format_message_matches_canonical_siwe_library() {
+        // Byte-identical to what the `siwe` npm library (which Venice's x402
+        // client imports) produces via `prepareMessage()` for the same inputs.
+        let petal = format_message(&SiweParams {
+            address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            uri: "https://api.venice.ai/api/v1/chat/completions".into(),
+            nonce: "0xabc123".into(),
+            issued_at_iso: "2024-01-01T00:00:00.000Z".into(),
+            expiration_iso: "2024-01-01T00:05:00.000Z".into(),
+        });
+        let canonical = "api.venice.ai wants you to sign in with your Ethereum account:\n\
+             0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\
+             \n\
+             Sign in to Venice AI\n\
+             \n\
+             URI: https://api.venice.ai/api/v1/chat/completions\n\
+             Version: 1\n\
+             Chain ID: 8453\n\
+             Nonce: 0xabc123\n\
+             Issued At: 2024-01-01T00:00:00.000Z\n\
+             Expiration Time: 2024-01-01T00:05:00.000Z";
+        assert_eq!(petal, canonical);
+    }
+
+    #[test]
+    fn eip191_hash_matches_viem_reference_vector() {
+        // viem `hashMessage` for the canonical SIWE string above. Venice
+        // verifies the SIWE signature by ecrecover over this prehash; equality
+        // here ⟹ the petal signs exactly the prehash Venice will reconstruct.
+        let message = "api.venice.ai wants you to sign in with your Ethereum account:\n\
+             0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\
+             \n\
+             Sign in to Venice AI\n\
+             \n\
+             URI: https://api.venice.ai/api/v1/chat/completions\n\
+             Version: 1\n\
+             Chain ID: 8453\n\
+             Nonce: 0xabc123\n\
+             Issued At: 2024-01-01T00:00:00.000Z\n\
+             Expiration Time: 2024-01-01T00:05:00.000Z";
+        let hash = eip191_signing_hash(message);
+        let expected =
+            hex::decode("768958987d01dfcfab498d155bebf322a44bcf1f85ede5e2f0a2f6894e252624")
+                .unwrap();
+        assert_eq!(&hash[..], &expected[..]);
+    }
+
+    #[test]
     fn session_creation_and_caching() {
         let mut host = MockHost {
             now_ms: 1_000_000,
@@ -314,15 +380,16 @@ mod tests {
 
         let wallet = "0xwallet1";
         let address = "0x1234567890abcdef1234567890abcdef12345678";
+        let url = "https://api.venice.ai/api/v1/chat/completions";
 
         // First call creates a session.
-        let session = get_or_create_session(&mut host, wallet, address).unwrap();
+        let session = get_or_create_session(&mut host, wallet, address, url).unwrap();
         assert_eq!(session.address, address);
         assert!(!session.header_b64.is_empty());
         assert_eq!(host.sign_requests.len(), 1);
 
         // Second call (same time) reuses cached session — no new sign.
-        let session2 = get_or_create_session(&mut host, wallet, address).unwrap();
+        let session2 = get_or_create_session(&mut host, wallet, address, url).unwrap();
         assert_eq!(session2.header_b64, session.header_b64);
         assert_eq!(host.sign_requests.len(), 1);
     }
@@ -338,16 +405,65 @@ mod tests {
 
         let wallet = "0xwallet2";
         let address = "0x1234567890abcdef1234567890abcdef12345678";
+        let url = "https://api.venice.ai/api/v1/chat/completions";
 
         // Create session.
-        let _ = get_or_create_session(&mut host, wallet, address).unwrap();
+        let _ = get_or_create_session(&mut host, wallet, address, url).unwrap();
         assert_eq!(host.sign_requests.len(), 1);
 
         // Advance past renewal threshold.
         host.now_ms = 1_000_000 + (SIWE_RENEWAL_SECS + 1) * 1000;
 
         // Should create new session.
-        let _ = get_or_create_session(&mut host, wallet, address).unwrap();
+        let _ = get_or_create_session(&mut host, wallet, address, url).unwrap();
         assert_eq!(host.sign_requests.len(), 2);
+    }
+
+    #[test]
+    fn session_is_cached_per_resource_url() {
+        // Each endpoint must get its own URI-bound session: a balance URL and
+        // a chat URL produce separate sessions (separate signs), and each is
+        // then reused. This matches Venice's per-request URI binding.
+        let mut host = MockHost {
+            now_ms: 1_000_000,
+            ..Default::default()
+        };
+        host.sign_results.push_back(Ok(signature()));
+        host.sign_results.push_back(Ok(signature()));
+
+        let wallet = "0xwallet3";
+        let address = "0x1234567890abcdef1234567890abcdef12345678";
+        let chat_url = "https://api.venice.ai/api/v1/chat/completions";
+        let balance_url = "https://api.venice.ai/api/v1/x402/balance/0x1234";
+
+        let chat_session = get_or_create_session(&mut host, wallet, address, chat_url).unwrap();
+        let balance_session =
+            get_or_create_session(&mut host, wallet, address, balance_url).unwrap();
+
+        // Different endpoints => different sessions (different messages/URIs).
+        assert_ne!(chat_session.header_b64, balance_session.header_b64);
+        assert!(chat_session.message.contains("/chat/completions"));
+        assert!(balance_session.message.contains("/x402/balance/"));
+        assert_eq!(host.sign_requests.len(), 2);
+
+        // Reusing the same endpoint does not re-sign.
+        let _ = get_or_create_session(&mut host, wallet, address, chat_url).unwrap();
+        assert_eq!(host.sign_requests.len(), 2);
+    }
+
+    #[test]
+    fn siwe_header_payload_uses_camel_case_chainid() {
+        // Wire-format check: Venice's canonical x402 client serializes the
+        // SIWE header payload with `chainId` (camelCase), not `chain_id`.
+        let payload = SiweHeaderPayload {
+            address: "0x1234567890abcdef1234567890abcdef12345678".into(),
+            message: "m".into(),
+            signature: "0x...".into(),
+            timestamp: 1,
+            chain_id: CHAIN_ID,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"chainId\":8453"), "got: {json}");
+        assert!(!json.contains("chain_id"), "got: {json}");
     }
 }

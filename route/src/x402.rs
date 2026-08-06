@@ -10,25 +10,34 @@ use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::common::{
-    self, CHAIN_ID, DispatchResponse, Host, USDC_BASE, USDC_NAME, USDC_VERSION, X402_VERSION,
-};
+use crate::common::{self, CHAIN_ID, DispatchResponse, Host, USDC_BASE, USDC_NAME, USDC_VERSION};
 
 /// One accepted payment option from a 402 response.
+///
+/// Field names deserialize from the x402 `accepts` entries (camelCase per
+/// spec): `payTo`, `maxTimeoutSeconds`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PaymentRequirement {
     pub scheme: String,
     pub network: String,
     pub asset: String,
     pub amount: String,
+    #[serde(rename = "payTo")]
     pub pay_to: String,
+    #[serde(rename = "maxTimeoutSeconds")]
     pub max_timeout_seconds: u64,
+    #[serde(default = "empty_object")]
     pub extra: serde_json::Value,
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 /// The 402 response body from Venice.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct PaymentRequired {
+    #[serde(rename = "x402Version")]
     pub x402_version: u64,
     #[serde(default)]
     pub error: Option<String>,
@@ -36,19 +45,30 @@ pub(crate) struct PaymentRequired {
 }
 
 /// The EIP-3009 authorization struct.
+///
+/// Field names serialize to the x402 wire format (camelCase) per the
+/// `exact`/EVM scheme spec — the facilitator validates against a strict
+/// schema that requires `validAfter` / `validBefore`.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct Eip3009Authorization {
     pub from: String,
     pub to: String,
     pub value: String,
+    #[serde(rename = "validAfter")]
     pub valid_after: String,
+    #[serde(rename = "validBefore")]
     pub valid_before: String,
     pub nonce: String,
 }
 
 /// The complete payment payload (pre-encoding).
+///
+/// Wire field names match the x402 `PaymentPayload` schema (`x402Version`,
+/// camelCase). `scheme` and `network` live at the top level alongside
+/// `x402Version` and `payload`, matching the canonical client.
 #[derive(Clone, Debug, Serialize)]
 struct PaymentPayload {
+    #[serde(rename = "x402Version")]
     x402_version: u64,
     scheme: String,
     network: String,
@@ -104,10 +124,13 @@ pub(crate) fn eip712_signing_hash(
     let typed: TypedData = serde_json::from_value(json!({
         "types": types,
         "primaryType": "TransferWithAuthorization",
+        // `chainId` is a JSON number (EIP-712 domain types it as uint256).
+        // Passing a string risks an encoding mismatch with the contract's own
+        // domain separator, which would make the signature fail ecrecover.
         "domain": {
             "name": token_name,
             "version": token_version,
-            "chainId": chain_id.to_string(),
+            "chainId": chain_id,
             "verifyingContract": verifying_contract
         },
         "message": {
@@ -151,12 +174,20 @@ pub(crate) fn extract_base_requirement(
 
 /// Build and sign an x402 payment header for a top-up.
 ///
+/// `amount_base_units` is the caller-chosen USDC amount in base units (6
+/// decimals) — this is the value actually transferred on-chain. It must be at
+/// least the minimum Venice quoted in the 402 response
+/// (`requirement.amount`). `x402_version` is the protocol version negotiated
+/// in the 402 response, not a hardcoded constant.
+///
 /// Returns the Base64-encoded `X-402-Payment` header value.
 pub(crate) fn build_payment_header(
     host: &mut impl Host,
     wallet: &str,
     from_address: &str,
     requirement: &PaymentRequirement,
+    amount_base_units: &str,
+    x402_version: u64,
     now_secs: u64,
 ) -> Result<String, DispatchResponse> {
     // Generate a random 32-byte nonce.
@@ -172,7 +203,7 @@ pub(crate) fn build_payment_header(
     let auth = Eip3009Authorization {
         from: from_address.to_owned(),
         to: requirement.pay_to.clone(),
-        value: requirement.amount.clone(),
+        value: amount_base_units.to_owned(),
         valid_after: valid_after.to_string(),
         valid_before: valid_before.to_string(),
         nonce,
@@ -205,7 +236,7 @@ pub(crate) fn build_payment_header(
         .sign_hash(&petal::SignRequest {
             wallet: wallet.to_owned(),
             hash32: hash,
-            purpose: "venice.x402".into(),
+            purpose: "venice-x402.topup".into(),
         })
         .map_err(common::backend)?;
 
@@ -213,7 +244,7 @@ pub(crate) fn build_payment_header(
 
     // Build and encode the payment payload.
     let payload = PaymentPayload {
-        x402_version: u64::from(X402_VERSION),
+        x402_version,
         scheme: requirement.scheme.clone(),
         network: requirement.network.clone(),
         payload: PaymentPayloadInner {
@@ -291,6 +322,31 @@ mod tests {
     }
 
     #[test]
+    fn eip712_hash_matches_viem_reference_vector() {
+        // Known vector produced by viem (`hashTypedData`) — the same library
+        // Venice's x402 client uses to build the signature the USDC contract
+        // accepts via `transferWithAuthorization`. The facilitator passes the
+        //authorization to the contract, which recomputes this exact hash and
+        // runs ecrecover. Equality here ⟹ the petal's hash == the contract's
+        // hash ⟹ any signature over it (including one from bloom:sign) is
+        // accepted.
+        let auth = Eip3009Authorization {
+            from: "0x857b06519E91e3A54538791bDbb0E22373e36b66".into(),
+            to: "0x2670B922ef37C7Df47158725C0CC407b5382293F".into(),
+            value: "5000000".into(),
+            valid_after: "1700000000".into(),
+            valid_before: "1700000300".into(),
+            nonce: "0xf3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480".into(),
+        };
+        let hash =
+            eip712_signing_hash(&auth, CHAIN_ID, USDC_BASE, USDC_NAME, USDC_VERSION).unwrap();
+        let expected =
+            hex::decode("0ec54d91e69b70ffed5015f83301ca356cc3763c6572e1ce8f5cb6a2dce7d5fd")
+                .unwrap();
+        assert_eq!(&hash[..], &expected[..]);
+    }
+
+    #[test]
     fn extract_base_requirement_succeeds() {
         let required = PaymentRequired {
             x402_version: 2,
@@ -325,24 +381,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_realistic_venice_402_body() {
+        // Venice (and the x402 spec) serialize the 402 body with camelCase
+        // keys: x402Version / payTo / maxTimeoutSeconds. A regression to
+        // snake_case here would silently break the entire top-up flow against
+        // live Venice. The `extra` field is optional in the spec.
+        let body = serde_json::to_vec(&json!({
+            "x402Version": 2,
+            "error": "insufficient_balance",
+            "accepts": [{
+                "scheme": "exact",
+                "network": "base",
+                "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "amount": "5000000",
+                "payTo": "0x2670b922ef37c7df47158725c0cc407b5382293f",
+                "maxTimeoutSeconds": 300,
+                "extra": {"name": "USD Coin", "version": "2"}
+            }, {
+                "scheme": "exact",
+                "network": "solana",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "amount": "5000000",
+                "payTo": "solana_payee",
+                "maxTimeoutSeconds": 300
+            }]
+        }))
+        .unwrap();
+        let required: PaymentRequired = serde_json::from_slice(&body).unwrap();
+        assert_eq!(required.x402_version, 2);
+        assert_eq!(required.accepts.len(), 2);
+        let base = extract_base_requirement(&required).unwrap();
+        assert_eq!(base.network, "base");
+        assert_eq!(base.pay_to, "0x2670b922ef37c7df47158725c0cc407b5382293f");
+        assert_eq!(base.max_timeout_seconds, 300);
+    }
+
+    #[test]
     fn payment_header_builds_and_signs() {
         let mut host = MockHost::default();
         host.sign_results.push_back(Ok(signature()));
 
         let requirement = base_requirement();
-        let header =
-            build_payment_header(&mut host, WALLET, ADDRESS, &requirement, 1_000_000).unwrap();
+        // The caller pays $10 (10,000,000 base units), above Venice's $5 minimum.
+        let header = build_payment_header(
+            &mut host,
+            WALLET,
+            ADDRESS,
+            &requirement,
+            "10000000",
+            2,
+            1_000_000,
+        )
+        .unwrap();
 
         // Should be valid base64.
         let decoded = decode_base64(&header).unwrap();
         let payload: Value = serde_json::from_slice(&decoded).unwrap();
 
-        assert_eq!(payload["x402_version"], 2);
+        assert_eq!(payload["x402Version"], 2);
         assert_eq!(payload["scheme"], "exact");
         assert_eq!(payload["network"], "base");
         assert_eq!(payload["payload"]["authorization"]["from"], ADDRESS);
         assert_eq!(payload["payload"]["authorization"]["to"], VENICE_PAYEE);
-        assert_eq!(payload["payload"]["authorization"]["value"], "5000000");
+        // The paid value is the CALLER's amount, not the requirement minimum.
+        assert_eq!(payload["payload"]["authorization"]["value"], "10000000");
         assert!(
             payload["payload"]["signature"]
                 .as_str()
@@ -352,7 +454,58 @@ mod tests {
 
         // Should have signed exactly once.
         assert_eq!(host.sign_requests.len(), 1);
-        assert_eq!(host.sign_requests[0].purpose, "venice.x402");
+        assert_eq!(host.sign_requests[0].purpose, "venice-x402.topup");
+    }
+
+    #[test]
+    fn payment_header_uses_caller_amount_not_requirement_minimum() {
+        // Lock in the Venice x402 semantics: requirement.amount is the MINIMUM
+        // (here $1 = 1,000,000 base units); the caller may pay more (here $7).
+        // The EIP-3009 `value` and on-chain transfer must equal the caller's
+        // amount, and `to`/`asset` must come from the requirement.
+        let mut host = MockHost::default();
+        host.sign_results.push_back(Ok(signature()));
+
+        let mut requirement = base_requirement();
+        requirement.amount = "1000000".into(); // $1 minimum
+
+        let header = build_payment_header(
+            &mut host,
+            WALLET,
+            ADDRESS,
+            &requirement,
+            "7000000",
+            2,
+            1_000_000,
+        )
+        .unwrap();
+
+        let decoded = decode_base64(&header).unwrap();
+        let payload: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(payload["payload"]["authorization"]["value"], "7000000");
+        assert_eq!(payload["payload"]["authorization"]["to"], VENICE_PAYEE);
+    }
+
+    #[test]
+    fn payment_header_passes_through_negotiated_version() {
+        let mut host = MockHost::default();
+        host.sign_results.push_back(Ok(signature()));
+
+        let requirement = base_requirement();
+        let header = build_payment_header(
+            &mut host,
+            WALLET,
+            ADDRESS,
+            &requirement,
+            "5000000",
+            3,
+            1_000_000,
+        )
+        .unwrap();
+
+        let decoded = decode_base64(&header).unwrap();
+        let payload: Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(payload["x402Version"], 3);
     }
 
     #[test]
@@ -361,7 +514,15 @@ mod tests {
         host.sign_results.push_back(Ok(approval()));
 
         let requirement = base_requirement();
-        let result = build_payment_header(&mut host, WALLET, ADDRESS, &requirement, 1_000_000);
+        let result = build_payment_header(
+            &mut host,
+            WALLET,
+            ADDRESS,
+            &requirement,
+            "5000000",
+            2,
+            1_000_000,
+        );
 
         assert!(result.is_err());
     }
@@ -373,23 +534,84 @@ mod tests {
 
         let requirement = base_requirement();
         let now = 1_000_000_u64;
-        let header = build_payment_header(&mut host, WALLET, ADDRESS, &requirement, now).unwrap();
+        let header =
+            build_payment_header(&mut host, WALLET, ADDRESS, &requirement, "5000000", 2, now)
+                .unwrap();
 
         let decoded = decode_base64(&header).unwrap();
         let payload: Value = serde_json::from_slice(&decoded).unwrap();
 
-        let valid_before: u64 = payload["payload"]["authorization"]["valid_before"]
+        let valid_before: u64 = payload["payload"]["authorization"]["validBefore"]
             .as_str()
             .unwrap()
             .parse()
             .unwrap();
         assert_eq!(valid_before, now + 300); // max_timeout_seconds = 300
 
-        let valid_after: u64 = payload["payload"]["authorization"]["valid_after"]
+        let valid_after: u64 = payload["payload"]["authorization"]["validAfter"]
             .as_str()
             .unwrap()
             .parse()
             .unwrap();
         assert_eq!(valid_after, now - 600); // 10 min before
+    }
+
+    #[test]
+    fn payment_header_wire_keys_match_x402_spec() {
+        // The facilitator validates the X-402-Payment header against a strict
+        // zod schema requiring camelCase keys: x402Version / validAfter /
+        // validBefore. Snake_case would be silently rejected. This test pins
+        // the exact on-the-wire object shape.
+        let mut host = MockHost::default();
+        host.sign_results.push_back(Ok(signature()));
+
+        let requirement = base_requirement();
+        let header = build_payment_header(
+            &mut host,
+            WALLET,
+            ADDRESS,
+            &requirement,
+            "5000000",
+            2,
+            1_000_000,
+        )
+        .unwrap();
+
+        let decoded = decode_base64(&header).unwrap();
+        let payload: Value = serde_json::from_slice(&decoded).unwrap();
+
+        // Top-level canonical keys.
+        assert_eq!(payload["x402Version"], 2);
+        assert_eq!(payload["scheme"], "exact");
+        assert_eq!(payload["network"], "base");
+        // No snake_case leakage anywhere in the wire object.
+        let wire = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !wire.contains("x402_version"),
+            "wire leaked x402_version: {wire}"
+        );
+        assert!(
+            !wire.contains("valid_after"),
+            "wire leaked valid_after: {wire}"
+        );
+        assert!(
+            !wire.contains("valid_before"),
+            "wire leaked valid_before: {wire}"
+        );
+
+        // Authorization keys.
+        let auth = &payload["payload"]["authorization"];
+        assert_eq!(auth["from"], ADDRESS);
+        assert_eq!(auth["to"], VENICE_PAYEE);
+        assert_eq!(auth["value"], "5000000");
+        assert!(auth["validAfter"].is_string());
+        assert!(auth["validBefore"].is_string());
+        assert!(auth["nonce"].as_str().unwrap().starts_with("0x"));
+        assert!(
+            payload["payload"]["signature"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x")
+        );
     }
 }

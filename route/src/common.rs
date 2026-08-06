@@ -31,9 +31,6 @@ pub(crate) const USDC_NAME: &str = "USD Coin";
 /// EIP-712 domain version for USDC.
 pub(crate) const USDC_VERSION: &str = "2";
 
-/// x402 protocol version used in payment headers.
-pub(crate) const X402_VERSION: u8 = 2;
-
 /// SIWE statement shown to the user in their wallet.
 pub(crate) const SIWE_STATEMENT: &str = "Sign in to Venice AI";
 
@@ -46,8 +43,12 @@ pub(crate) const SIWE_RENEWAL_SECS: u64 = 270;
 /// Maximum HTTP response body (512 KB).
 pub(crate) const MAX_BODY: usize = 512 * 1024;
 
-/// Maximum stored value size (32 KB).
-pub(crate) const MAX_STORED: usize = 32 * 1024;
+/// Maximum stored value size (1 MB). Sized so that a chat result — which
+/// stores the request messages plus a response that may be up to `MAX_BODY`
+/// long — can always be written and read back. The previous 32 KB cap would
+/// silently fail the read-back (after the user had already paid for the
+/// inference) on any sizable model response.
+pub(crate) const MAX_STORED: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Host trait
@@ -126,6 +127,52 @@ pub(crate) fn is_evm_address(value: &str) -> bool {
     value.len() == 42
         && value.starts_with("0x")
         && value[2..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parse a non-negative USD decimal string (e.g. `"5.00"`, `"0.25"`) into USDC
+/// base units (6 decimals). Rejects empty strings, signs, non-digits, and more
+/// than 6 fractional digits (USDC cannot represent sub-micro-cent). Use this
+/// instead of `f64` parsing: the result drives an on-chain `uint256` transfer
+/// value, so it must be exact.
+pub(crate) fn parse_usd_to_base_units(amount_usd: &str) -> Result<u64, String> {
+    let s = amount_usd.trim();
+    if s.is_empty() {
+        return Err("amount_usd is empty".into());
+    }
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("amount_usd is not a valid number: {amount_usd}"));
+    }
+    if !frac.is_empty() && !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("amount_usd is not a valid number: {amount_usd}"));
+    }
+    if frac.len() > 6 {
+        return Err(format!(
+            "amount_usd has more than 6 decimal places (USDC uses 6 decimals): {amount_usd}"
+        ));
+    }
+    let whole_val: u64 = whole
+        .parse()
+        .map_err(|_| format!("amount_usd is too large: {amount_usd}"))?;
+    let whole_units = whole_val
+        .checked_mul(1_000_000)
+        .ok_or_else(|| format!("amount_usd is too large: {amount_usd}"))?;
+    // Pad the fractional part to exactly 6 digits (USDC decimals).
+    let mut frac_padded = [b'0'; 6];
+    for (i, b) in frac.bytes().enumerate() {
+        frac_padded[i] = b;
+    }
+    // SAFETY: frac_padded is always 6 ASCII digits.
+    let frac_val: u64 = std::str::from_utf8(&frac_padded)
+        .unwrap()
+        .parse()
+        .map_err(|_| format!("amount_usd is not a valid number: {amount_usd}"))?;
+    whole_units
+        .checked_add(frac_val)
+        .ok_or_else(|| format!("amount_usd is too large: {amount_usd}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -283,5 +330,39 @@ pub(crate) mod test_helpers {
     /// Deterministic 32-byte nonce for testing.
     pub(crate) fn test_nonce() -> Vec<u8> {
         (0..32).map(|i| i as u8).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_usd_to_base_units;
+
+    #[test]
+    fn parses_whole_and_fractional_usd() {
+        assert_eq!(parse_usd_to_base_units("5.00").unwrap(), 5_000_000);
+        assert_eq!(parse_usd_to_base_units("0.25").unwrap(), 250_000);
+        assert_eq!(parse_usd_to_base_units("10").unwrap(), 10_000_000);
+        assert_eq!(parse_usd_to_base_units("0.000001").unwrap(), 1);
+    }
+
+    #[test]
+    fn pads_short_fractional_part() {
+        assert_eq!(parse_usd_to_base_units("5.1").unwrap(), 5_100_000);
+        assert_eq!(parse_usd_to_base_units("5.123").unwrap(), 5_123_000);
+    }
+
+    #[test]
+    fn rejects_non_positive_and_garbage() {
+        assert!(parse_usd_to_base_units("0").is_ok_and(|v| v == 0));
+        assert!(parse_usd_to_base_units("").is_err());
+        assert!(parse_usd_to_base_units("-5.00").is_err());
+        assert!(parse_usd_to_base_units("five").is_err());
+        assert!(parse_usd_to_base_units("5.abc").is_err());
+    }
+
+    #[test]
+    fn rejects_more_than_six_decimals() {
+        assert!(parse_usd_to_base_units("5.0000001").is_err());
+        assert!(parse_usd_to_base_units("0.1234567").is_err());
     }
 }
