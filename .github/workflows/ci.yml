@@ -19,12 +19,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Format check
         run: cargo fmt --check --manifest-path route/Cargo.toml
@@ -37,3 +38,12 @@ jobs:
 
       - name: Tests
         run: cargo test --manifest-path route/Cargo.toml
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --locked
+
+      - name: Install petal CLI
+        run: cargo install --git https://github.com/bloom-directory/petal bloom-petal-cli --locked
+
+      - name: Petal build (route-file compile gate)
+        run: bash scripts/build-petal.sh
