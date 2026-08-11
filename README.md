@@ -31,7 +31,7 @@ route/
 ├── files/
 │   ├── status.json.rs              — Static petal health endpoint
 │   ├── models.json.rs              — Proxy to Venice's public models list
-│   ├── balance/[wallet].json.rs    — Stored balance view (read-only)
+│   ├── balance/[wallet].json.rs    — Explicit refresh write + cached balance read
 │   ├── topup/[wallet].json.rs      — Top-up handler (SIWE + EIP-3009 payment)
 │   ├── chat/[wallet]/[id].json.rs  — Chat completion handler (SIWE auth)
 │   └── $index.rs                   — Directory listing
@@ -59,6 +59,12 @@ Static health check endpoint. Returns petal name and version.
 
 ### `GET /balance/{wallet}.json`
 Reads the last known balance from the state store. Wallet alias is validated as a safe path segment.
+On a fresh install this returns not found until the balance has been refreshed.
+
+### `POST /balance/{wallet}.json`
+Refreshes the cached balance. Write either an empty body or `{}`. The wallet signs
+the `venice-x402.balance` SIWE intent through Bloom's owner-visible approval flow;
+after approval, retry the identical write and then read the route with `GET`.
 
 ### `POST /topup/{wallet}.json`
 Initiates an x402 top-up. Requires a signed request with:
