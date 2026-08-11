@@ -247,7 +247,10 @@ pub(crate) fn top_up<H: Host>(
     let retry_request = petal::HttpRequest {
         method: "POST".into(),
         url: format!("{VENICE_API}/x402/top-up"),
-        headers: vec![("X-402-Payment".into(), payment_header)],
+        headers: vec![
+            ("content-type".into(), "application/json".into()),
+            ("X-402-Payment".into(), payment_header),
+        ],
         body: serde_json::to_vec(&json!({}))
             .map_err(|e| common::backend(format!("serialize retry body: {e}")))?,
     };

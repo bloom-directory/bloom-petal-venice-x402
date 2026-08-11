@@ -1,5 +1,5 @@
 petal::route_file!(
-    spec: petal::signing_write_spec("venice-x402.chat").caps(&[
+    spec: petal::signing_write_spec("venice-x402.siwe").caps(&[
         "bloom:http",
         "bloom:store",
         "bloom:sign",
