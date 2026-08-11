@@ -12,7 +12,7 @@ alias = "venice_x402_route"
 [sdk]
 package = "bloom-petal-sdk"
 git = "https://github.com/bloom-directory/petal"
-rev = "b9fc22d6d8211bc41304b38b1ef8b5269c8035bd"
+rev = "eda6647c523bba161eaa22812aa0e75ec7782404"
 
 [dependencies]
 # EIP-712 typed-data hashing for EIP-3009 payment authorization.
