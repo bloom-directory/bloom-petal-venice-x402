@@ -207,14 +207,6 @@ pub(crate) fn top_up<H: Host>(
         };
     let mut pending = match stored_pending {
         Some(pending) => {
-            if pending.wallet != wallet
-                || !pending.address.eq_ignore_ascii_case(address)
-                || pending.amount_base_units != amount_base_units_str
-            {
-                return Err(common::invalid(
-                    "a different top-up is already awaiting completion for this wallet",
-                ));
-            }
             let valid_before = pending
                 .prepared
                 .authorization
@@ -232,6 +224,14 @@ pub(crate) fn top_up<H: Host>(
                     now_secs,
                 )?
             } else {
+                if pending.wallet != wallet
+                    || !pending.address.eq_ignore_ascii_case(address)
+                    || pending.amount_base_units != amount_base_units_str
+                {
+                    return Err(common::invalid(
+                        "a different top-up is already awaiting completion for this wallet",
+                    ));
+                }
                 pending
             }
         }
