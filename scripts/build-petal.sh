@@ -14,7 +14,7 @@ if ! command -v wasm-tools >/dev/null 2>&1; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PETAL_REV="eda6647c523bba161eaa22812aa0e75ec7782404"
+PETAL_REV="61938d0c127cfe03c7e3e55baed0ba1439bc5ca2"
 
 if [[ -n "${PETAL_BIN:-}" ]]; then
   "$PETAL_BIN" build --root "$ROOT"
