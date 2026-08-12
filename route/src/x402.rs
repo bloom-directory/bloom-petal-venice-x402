@@ -6,7 +6,6 @@
 //! Base64 JSON string for the `X-402-Payment` header.
 
 use alloy_dyn_abi::eip712::TypedData;
-use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -49,7 +48,7 @@ pub(crate) struct PaymentRequired {
 /// Field names serialize to the x402 wire format (camelCase) per the
 /// `exact`/EVM scheme spec — the facilitator validates against a strict
 /// schema that requires `validAfter` / `validBefore`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Eip3009Authorization {
     pub from: String,
     pub to: String,
@@ -81,6 +80,18 @@ struct PaymentPayloadInner {
     authorization: Eip3009Authorization,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct PreparedPayment {
+    pub(crate) requirement: PaymentRequirement,
+    pub(crate) authorization: Eip3009Authorization,
+    pub(crate) x402_version: u64,
+}
+
+pub(crate) enum PaymentSignOutcome {
+    Header(String),
+    ApprovalPending { action_id: String, expires_ms: u64 },
+}
+
 /// EIP-712 type definitions for `TransferWithAuthorization`.
 fn authorization_types() -> Value {
     json!({
@@ -99,6 +110,7 @@ fn authorization_types() -> Value {
 ///
 /// Uses `alloy_dyn_abi::eip712::TypedData` to ensure the hash matches what
 /// EVM wallets produce with `signTypedData`.
+#[cfg(test)]
 pub(crate) fn eip712_signing_hash(
     auth: &Eip3009Authorization,
     chain_id: u64,
@@ -106,6 +118,23 @@ pub(crate) fn eip712_signing_hash(
     token_name: &str,
     token_version: &str,
 ) -> Result<[u8; 32], String> {
+    let preimage = eip712_signing_preimage(
+        auth,
+        chain_id,
+        verifying_contract,
+        token_name,
+        token_version,
+    )?;
+    Ok(alloy_primitives::keccak256(preimage).into())
+}
+
+pub(crate) fn eip712_signing_preimage(
+    auth: &Eip3009Authorization,
+    chain_id: u64,
+    verifying_contract: &str,
+    token_name: &str,
+    token_version: &str,
+) -> Result<Vec<u8>, String> {
     let mut types = Map::new();
     types.insert(
         "EIP712Domain".into(),
@@ -144,13 +173,16 @@ pub(crate) fn eip712_signing_hash(
     }))
     .map_err(|e| format!("invalid EIP-712 typed data: {e}"))?;
 
-    let hash: B256 = typed
-        .eip712_signing_hash()
-        .map_err(|e| format!("cannot hash EIP-712 typed data: {e}"))?;
-
-    let mut result = [0u8; 32];
-    result.copy_from_slice(hash.as_slice());
-    Ok(result)
+    let mut preimage = Vec::with_capacity(66);
+    preimage.extend_from_slice(&[0x19, 0x01]);
+    preimage.extend_from_slice(typed.domain().separator().as_slice());
+    preimage.extend_from_slice(
+        typed
+            .hash_struct()
+            .map_err(|e| format!("cannot hash EIP-712 typed data: {e}"))?
+            .as_slice(),
+    );
+    Ok(preimage)
 }
 
 /// Extract a USDC-on-Base payment requirement from a 402 response.
@@ -193,6 +225,7 @@ fn is_base_mainnet(network: &str) -> bool {
 /// in the 402 response, not a hardcoded constant.
 ///
 /// Returns the Base64-encoded `X-402-Payment` header value.
+#[cfg(test)]
 pub(crate) fn build_payment_header(
     host: &mut impl Host,
     wallet: &str,
@@ -202,6 +235,36 @@ pub(crate) fn build_payment_header(
     x402_version: u64,
     now_secs: u64,
 ) -> Result<String, DispatchResponse> {
+    let prepared = prepare_payment(
+        host,
+        from_address,
+        requirement,
+        amount_base_units,
+        x402_version,
+        now_secs,
+    )?;
+    match sign_payment_header(host, wallet, &prepared, None)? {
+        PaymentSignOutcome::Header(header) => Ok(header),
+        PaymentSignOutcome::ApprovalPending {
+            action_id,
+            expires_ms,
+        } => Err(petal::error(
+            -2,
+            format!(
+                "x402 payment approval required for action {action_id} (expires {expires_ms}); open the owner-visible Bloom signing request, approve it, then retry the exact write"
+            ),
+        )),
+    }
+}
+
+pub(crate) fn prepare_payment(
+    host: &mut impl Host,
+    from_address: &str,
+    requirement: &PaymentRequirement,
+    amount_base_units: &str,
+    x402_version: u64,
+    now_secs: u64,
+) -> Result<PreparedPayment, DispatchResponse> {
     // Generate a random 32-byte nonce.
     let nonce_bytes = host.random_bytes(32).map_err(common::backend)?;
     let nonce = format!("0x{}", hex::encode(&nonce_bytes));
@@ -221,7 +284,21 @@ pub(crate) fn build_payment_header(
         nonce,
     };
 
-    // Extract token name/version from the requirement's extra field.
+    Ok(PreparedPayment {
+        requirement: requirement.clone(),
+        authorization: auth,
+        x402_version,
+    })
+}
+
+pub(crate) fn sign_payment_header(
+    host: &mut impl Host,
+    wallet: &str,
+    prepared: &PreparedPayment,
+    approval_hint: Option<String>,
+) -> Result<PaymentSignOutcome, DispatchResponse> {
+    let requirement = &prepared.requirement;
+    let auth = &prepared.authorization;
     let token_name = requirement
         .extra
         .get("name")
@@ -234,41 +311,60 @@ pub(crate) fn build_payment_header(
         .unwrap_or(USDC_VERSION);
 
     // Compute the EIP-712 signing hash.
-    let hash = eip712_signing_hash(
-        &auth,
+    let preimage = eip712_signing_preimage(
+        auth,
         CHAIN_ID,
         &requirement.asset,
         token_name,
         token_version,
     )
     .map_err(common::backend)?;
+    let hash = alloy_primitives::keccak256(&preimage).into();
 
     // Sign via Bloom.
-    let outcome = host
-        .sign_hash(&petal::SignRequest {
-            wallet: wallet.to_owned(),
-            hash32: hash,
-            purpose: "venice-x402.topup".into(),
-        })
-        .map_err(common::backend)?;
+    let outcome = common::request_payload_signature(
+        host,
+        wallet,
+        preimage,
+        hash,
+        "venice-x402.topup",
+        approval_hint,
+        serde_json::to_vec(&auth).ok(),
+    )
+    .map_err(common::backend)?;
 
-    let signature = common::require_signature(outcome, "x402 payment authorization")?;
+    let signature = match outcome {
+        petal::SignOutcome::Signature(bytes) => {
+            common::signature_hex(bytes).map_err(common::backend)?
+        }
+        petal::SignOutcome::ApprovalPending {
+            action_id,
+            expires_ms,
+        } => {
+            return Ok(PaymentSignOutcome::ApprovalPending {
+                action_id,
+                expires_ms,
+            });
+        }
+    };
 
     // Build and encode the payment payload.
     let payload = PaymentPayload {
-        x402_version,
+        x402_version: prepared.x402_version,
         scheme: requirement.scheme.clone(),
         network: requirement.network.clone(),
         payload: PaymentPayloadInner {
             signature,
-            authorization: auth,
+            authorization: auth.clone(),
         },
     };
 
     let payload_json = serde_json::to_vec(&payload)
         .map_err(|e| common::backend(format!("serialize payment: {e}")))?;
 
-    Ok(common::encode_base64(&payload_json))
+    Ok(PaymentSignOutcome::Header(common::encode_base64(
+        &payload_json,
+    )))
 }
 
 #[cfg(test)]
@@ -469,7 +565,7 @@ mod tests {
 
         // Should have signed exactly once.
         assert_eq!(host.sign_requests.len(), 1);
-        assert_eq!(host.sign_requests[0].purpose, "venice-x402.topup");
+        assert_eq!(host.sign_requests[0].operation_class, "venice-x402.topup");
     }
 
     #[test]

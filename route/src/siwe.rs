@@ -36,6 +36,16 @@ pub(crate) struct SiweSession {
     pub header_b64: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingSiwe {
+    address: String,
+    resource_url: String,
+    message: String,
+    created_ms: u64,
+    approval_action_id: Option<String>,
+    approval_expires_ms: Option<u64>,
+}
+
 /// The decoded SIWE header payload (Base64-decoded JSON).
 ///
 /// Field names match Venice's canonical x402 client wire format
@@ -93,12 +103,18 @@ pub(crate) fn format_message(params: &SiweParams) -> String {
 
 /// Compute the EIP-191 personal-message signing hash:
 /// `keccak256("\x19Ethereum Signed Message:\n" + len + message)`.
+#[cfg(test)]
 pub(crate) fn eip191_signing_hash(message: &str) -> [u8; 32] {
+    let preimage = eip191_signing_preimage(message);
+    Keccak256::digest(preimage).into()
+}
+
+pub(crate) fn eip191_signing_preimage(message: &str) -> Vec<u8> {
     let prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
-    let mut hasher = Keccak256::new();
-    hasher.update(prefix.as_bytes());
-    hasher.update(message.as_bytes());
-    hasher.finalize().into()
+    let mut preimage = Vec::with_capacity(prefix.len() + message.len());
+    preimage.extend_from_slice(prefix.as_bytes());
+    preimage.extend_from_slice(message.as_bytes());
+    preimage
 }
 
 /// Convert Unix milliseconds to an ISO-8601 UTC timestamp string.
@@ -177,6 +193,7 @@ pub(crate) fn get_or_create_session(
     wallet: &str,
     address: &str,
     resource_url: &str,
+    operation_class: &str,
 ) -> Result<SiweSession, DispatchResponse> {
     let key = session_key(wallet, resource_url);
 
@@ -185,31 +202,76 @@ pub(crate) fn get_or_create_session(
         return Ok(session);
     }
 
-    // Create new session.
     let now_ms = host.now_ms().map_err(common::backend)?;
-    let nonce = generate_nonce(host).map_err(common::backend)?;
-    let issued_iso = ms_to_iso(now_ms);
-    let expiry_ms = now_ms + SIWE_TTL_SECS * 1000;
-    let expiration_iso = ms_to_iso(expiry_ms);
+    let pending_key = pending_session_key(wallet, resource_url);
+    let existing_pending = load_pending_session(host, &pending_key)?;
+    let mut pending = match existing_pending {
+        Some(pending)
+            if pending.address.eq_ignore_ascii_case(address)
+                && pending.resource_url == resource_url
+                && now_ms.saturating_sub(pending.created_ms) < SIWE_RENEWAL_SECS * 1000 =>
+        {
+            pending
+        }
+        _ => {
+            let nonce = generate_nonce(host).map_err(common::backend)?;
+            let message = format_message(&SiweParams {
+                address: address.to_owned(),
+                uri: resource_url.to_owned(),
+                nonce,
+                issued_at_iso: ms_to_iso(now_ms),
+                expiration_iso: ms_to_iso(now_ms + SIWE_TTL_SECS * 1000),
+            });
+            let pending = PendingSiwe {
+                address: address.to_owned(),
+                resource_url: resource_url.to_owned(),
+                message,
+                created_ms: now_ms,
+                approval_action_id: None,
+                approval_expires_ms: None,
+            };
+            save_pending_session(host, &pending_key, &pending)?;
+            pending
+        }
+    };
+    let message = pending.message.clone();
 
-    let message = format_message(&SiweParams {
-        address: address.to_owned(),
-        uri: resource_url.to_owned(),
-        nonce: nonce.clone(),
-        issued_at_iso: issued_iso,
-        expiration_iso: expiration_iso.clone(),
-    });
+    let preimage = eip191_signing_preimage(&message);
+    let hash = Keccak256::digest(&preimage).into();
+    let outcome = common::request_payload_signature(
+        host,
+        wallet,
+        preimage,
+        hash,
+        operation_class,
+        pending
+            .approval_expires_ms
+            .is_some_and(|expires_ms| expires_ms > now_ms)
+            .then(|| pending.approval_action_id.clone())
+            .flatten(),
+        Some(message.as_bytes().to_vec()),
+    )
+    .map_err(common::backend)?;
 
-    let hash = eip191_signing_hash(&message);
-    let outcome = host
-        .sign_hash(&petal::SignRequest {
-            wallet: wallet.to_owned(),
-            hash32: hash,
-            purpose: "venice-x402.siwe".into(),
-        })
-        .map_err(common::backend)?;
-
-    let signature = common::require_signature(outcome, "SIWE authentication")?;
+    let signature = match outcome {
+        petal::SignOutcome::Signature(bytes) => {
+            common::signature_hex(bytes).map_err(common::backend)?
+        }
+        petal::SignOutcome::ApprovalPending {
+            action_id,
+            expires_ms,
+        } => {
+            pending.approval_action_id = Some(action_id.clone());
+            pending.approval_expires_ms = Some(expires_ms);
+            save_pending_session(host, &pending_key, &pending)?;
+            return Err(petal::error(
+                -2,
+                format!(
+                    "SIWE approval required for action {action_id}; open the owner-visible Bloom signing request, approve it, then retry the exact write"
+                ),
+            ));
+        }
+    };
 
     let payload = SiweHeaderPayload {
         address: address.to_owned(),
@@ -234,8 +296,31 @@ pub(crate) fn get_or_create_session(
         .map_err(|e| common::backend(format!("serialize session: {e}")))?;
     host.store_put(&key, &session_bytes, true)
         .map_err(common::backend)?;
+    host.store_del(&pending_key).map_err(common::backend)?;
 
     Ok(session)
+}
+
+fn load_pending_session(
+    host: &mut impl Host,
+    key: &str,
+) -> Result<Option<PendingSiwe>, DispatchResponse> {
+    let Some(bytes) = host.store_get(key, MAX_STORED).map_err(common::backend)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        common::backend(format!("stored pending SIWE request is invalid: {error}"))
+    })
+}
+
+fn save_pending_session(
+    host: &mut impl Host,
+    key: &str,
+    pending: &PendingSiwe,
+) -> Result<(), DispatchResponse> {
+    let bytes = serde_json::to_vec(pending)
+        .map_err(|error| common::backend(format!("serialize pending SIWE request: {error}")))?;
+    host.store_put(key, &bytes, true).map_err(common::backend)
 }
 
 /// Try to load a cached SIWE session from the store.
@@ -265,6 +350,10 @@ fn session_key(wallet: &str, resource_url: &str) -> String {
     hasher.update(resource_url.as_bytes());
     let slug = hex::encode(&hasher.finalize()[..8]);
     format!("venice-x402/sessions/{wallet}/{slug}")
+}
+
+fn pending_session_key(wallet: &str, resource_url: &str) -> String {
+    format!("{}.pending", session_key(wallet, resource_url))
 }
 
 #[cfg(test)]
@@ -383,15 +472,52 @@ mod tests {
         let url = "https://api.venice.ai/api/v1/chat/completions";
 
         // First call creates a session.
-        let session = get_or_create_session(&mut host, wallet, address, url).unwrap();
+        let session =
+            get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").unwrap();
         assert_eq!(session.address, address);
         assert!(!session.header_b64.is_empty());
         assert_eq!(host.sign_requests.len(), 1);
 
         // Second call (same time) reuses cached session — no new sign.
-        let session2 = get_or_create_session(&mut host, wallet, address, url).unwrap();
+        let session2 =
+            get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").unwrap();
         assert_eq!(session2.header_b64, session.header_b64);
         assert_eq!(host.sign_requests.len(), 1);
+    }
+
+    #[test]
+    fn approval_retry_reuses_identical_siwe_payload_and_hint() {
+        let mut host = MockHost {
+            now_ms: 1_000_000,
+            ..Default::default()
+        };
+        host.random_data.push_back(test_nonce());
+        host.sign_results.push_back(Ok(approval()));
+        host.sign_results.push_back(Ok(signature()));
+
+        let wallet = "minnow-passkey";
+        let address = "0x1234567890abcdef1234567890abcdef12345678";
+        let url = "https://api.venice.ai/api/v1/chat/completions";
+        assert!(
+            get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").is_err()
+        );
+        let session =
+            get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").unwrap();
+
+        assert!(!session.header_b64.is_empty());
+        assert_eq!(host.sign_requests.len(), 2);
+        assert_eq!(
+            host.sign_requests[0].preimage,
+            host.sign_requests[1].preimage
+        );
+        assert_eq!(
+            host.sign_requests[0].claimed_hash,
+            host.sign_requests[1].claimed_hash
+        );
+        assert_eq!(
+            host.sign_requests[1].approval_hint.as_deref(),
+            Some("approval-1")
+        );
     }
 
     #[test]
@@ -408,14 +534,14 @@ mod tests {
         let url = "https://api.venice.ai/api/v1/chat/completions";
 
         // Create session.
-        let _ = get_or_create_session(&mut host, wallet, address, url).unwrap();
+        let _ = get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").unwrap();
         assert_eq!(host.sign_requests.len(), 1);
 
         // Advance past renewal threshold.
         host.now_ms = 1_000_000 + (SIWE_RENEWAL_SECS + 1) * 1000;
 
         // Should create new session.
-        let _ = get_or_create_session(&mut host, wallet, address, url).unwrap();
+        let _ = get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").unwrap();
         assert_eq!(host.sign_requests.len(), 2);
     }
 
@@ -436,9 +562,17 @@ mod tests {
         let chat_url = "https://api.venice.ai/api/v1/chat/completions";
         let balance_url = "https://api.venice.ai/api/v1/x402/balance/0x1234";
 
-        let chat_session = get_or_create_session(&mut host, wallet, address, chat_url).unwrap();
-        let balance_session =
-            get_or_create_session(&mut host, wallet, address, balance_url).unwrap();
+        let chat_session =
+            get_or_create_session(&mut host, wallet, address, chat_url, "venice-x402.chat")
+                .unwrap();
+        let balance_session = get_or_create_session(
+            &mut host,
+            wallet,
+            address,
+            balance_url,
+            "venice-x402.balance",
+        )
+        .unwrap();
 
         // Different endpoints => different sessions (different messages/URIs).
         assert_ne!(chat_session.header_b64, balance_session.header_b64);
@@ -447,7 +581,8 @@ mod tests {
         assert_eq!(host.sign_requests.len(), 2);
 
         // Reusing the same endpoint does not re-sign.
-        let _ = get_or_create_session(&mut host, wallet, address, chat_url).unwrap();
+        let _ = get_or_create_session(&mut host, wallet, address, chat_url, "venice-x402.chat")
+            .unwrap();
         assert_eq!(host.sign_requests.len(), 2);
     }
 

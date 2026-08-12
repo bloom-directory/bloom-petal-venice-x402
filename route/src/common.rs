@@ -5,7 +5,12 @@
 //! following the same pattern as the gasless petal.
 
 use base64::Engine;
-use petal::{HostStatus, HttpRequest, HttpResponse, SdkError, SignHashOutcome, SignRequest};
+use petal::{
+    HostStatus, HttpRequest, HttpResponse, PayloadSignItem, PayloadSignRequest, SdkError,
+    SignOutcome, SignSelector,
+};
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 pub(crate) use petal::DispatchResponse;
 
@@ -59,18 +64,38 @@ pub const MAX_STORED: usize = 1024 * 1024;
 pub(crate) trait Host {
     fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
     fn store_put(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String>;
+    fn store_del(&mut self, key: &str) -> Result<(), String>;
     fn http_fetch(
         &mut self,
         request: &HttpRequest,
         max_bytes: usize,
     ) -> Result<HttpResponse, String>;
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String>;
+    fn sign_payload(&mut self, request: &PayloadSignRequest) -> Result<SignOutcome, String>;
+    fn package_hash(&self) -> &str;
+    fn route_id(&self) -> &str;
     fn now_ms(&mut self) -> Result<u64, String>;
     fn random_bytes(&mut self, len: usize) -> Result<Vec<u8>, String>;
 }
 
 /// Production host backed by Bloom SDK bindings.
-pub(crate) struct BloomHost;
+pub(crate) struct BloomHost {
+    pub(crate) package_hash: String,
+    pub(crate) route_id: String,
+}
+
+impl BloomHost {
+    pub(crate) fn new(ctx: &petal::Ctx) -> Result<Self, DispatchResponse> {
+        let route_id = ctx
+            .params
+            .iter()
+            .find_map(|(name, value)| (name == "bloom.route_id").then_some(value.clone()))
+            .ok_or_else(|| backend("trusted Petal route id is unavailable"))?;
+        Ok(Self {
+            package_hash: ctx.package_hash.clone(),
+            route_id,
+        })
+    }
+}
 
 impl Host for BloomHost {
     fn store_get(&mut self, key: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
@@ -85,6 +110,10 @@ impl Host for BloomHost {
         petal::sdk::store_put(key, value, secret).map_err(|error| error.message())
     }
 
+    fn store_del(&mut self, key: &str) -> Result<(), String> {
+        petal::sdk::store_del(key).map_err(|error| error.message())
+    }
+
     fn http_fetch(
         &mut self,
         request: &HttpRequest,
@@ -93,8 +122,16 @@ impl Host for BloomHost {
         petal::sdk::http_fetch(request, max_bytes).map_err(|error| error.message())
     }
 
-    fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
-        petal::sdk::sign_hash(request).map_err(|error| error.message())
+    fn sign_payload(&mut self, request: &PayloadSignRequest) -> Result<SignOutcome, String> {
+        petal::sdk::sign_payload(request).map_err(|error| error.message())
+    }
+
+    fn package_hash(&self) -> &str {
+        &self.package_hash
+    }
+
+    fn route_id(&self) -> &str {
+        &self.route_id
     }
 
     fn now_ms(&mut self) -> Result<u64, String> {
@@ -104,6 +141,58 @@ impl Host for BloomHost {
     fn random_bytes(&mut self, len: usize) -> Result<Vec<u8>, String> {
         petal::sdk::random_bytes(len).map_err(|error| error.message())
     }
+}
+
+pub(crate) fn request_payload_signature(
+    host: &mut impl Host,
+    wallet: &str,
+    preimage: Vec<u8>,
+    claimed_hash: [u8; 32],
+    operation_class: &str,
+    approval_hint: Option<String>,
+    action: Option<Vec<u8>>,
+) -> Result<SignOutcome, String> {
+    let payload_digest = petal::payload_batch_digest(&[PayloadSignItem {
+        preimage: preimage.clone(),
+        claimed_hash,
+    }])
+    .map_err(|error| error.message())?;
+    let nonce = Sha256::digest(
+        [
+            host.package_hash().as_bytes(),
+            host.route_id().as_bytes(),
+            operation_class.as_bytes(),
+            payload_digest.as_slice(),
+        ]
+        .concat(),
+    );
+    let claim = json!({
+        "package_hash": host.package_hash(),
+        "route": host.route_id(),
+        "operation_class": operation_class,
+        "crypto_suite": "secp256k1-keccak256-recoverable",
+        "payload_digest": hex::encode(payload_digest),
+        "ordered_hashes": [hex::encode(claimed_hash)],
+        "declared_debits": [],
+        "declared_destinations": [],
+        "declared_fee": {"kind": "none"},
+        "nonce": hex::encode(&nonce[..16]),
+        "claim_assurance": {"kind": "machine_asserted"}
+    });
+    host.sign_payload(&PayloadSignRequest {
+        wallet: wallet.to_owned(),
+        preimage,
+        claimed_hash,
+        signature_algorithm: "secp256k1-keccak256-recoverable".into(),
+        operation_class: operation_class.into(),
+        petal_use_claim_jcs: serde_jcs::to_vec(&claim).map_err(|error| error.to_string())?,
+        claim_assurance_evidence: None,
+        approval_hint,
+        action,
+        advisory: None,
+        selector: SignSelector::Exact,
+        key_ref_jcs: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -202,32 +291,6 @@ pub(crate) fn signature_hex(mut bytes: Vec<u8>) -> Result<String, String> {
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
-/// Extract the signing outcome: either a signature hex string, or propagate
-/// the `ApprovalRequired` dispatch response.
-pub(crate) fn require_signature(
-    outcome: SignHashOutcome,
-    approval_label: &str,
-) -> Result<String, DispatchResponse> {
-    match outcome {
-        SignHashOutcome::Signature(bytes) => signature_hex(bytes).map_err(backend),
-        SignHashOutcome::ApprovalRequired {
-            action_id,
-            ceremony_url,
-            expires_ms,
-        } => Err(petal::error(
-            -2,
-            serde_json::to_string(&serde_json::json!({
-                "status": "approval_required",
-                "label": approval_label,
-                "action_id": action_id,
-                "ceremony_url": ceremony_url,
-                "expires_ms": expires_ms,
-            }))
-            .unwrap_or_else(|_| format!("approval required: {approval_label}")),
-        )),
-    }
-}
-
 /// Compact JSON representation of a serde_json::Value, truncated for error messages.
 pub(crate) fn compact(value: &serde_json::Value) -> String {
     serde_json::to_string(value)
@@ -265,9 +328,9 @@ pub(crate) mod test_helpers {
     pub(crate) struct MockHost {
         pub(crate) store: HashMap<String, Vec<u8>>,
         pub(crate) http_results: VecDeque<Result<HttpResponse, String>>,
-        pub(crate) sign_results: VecDeque<Result<SignHashOutcome, String>>,
+        pub(crate) sign_results: VecDeque<Result<SignOutcome, String>>,
         pub(crate) requests: Vec<HttpRequest>,
-        pub(crate) sign_requests: Vec<SignRequest>,
+        pub(crate) sign_requests: Vec<PayloadSignRequest>,
         pub(crate) now_ms: u64,
         pub(crate) random_data: VecDeque<Vec<u8>>,
     }
@@ -282,6 +345,11 @@ pub(crate) mod test_helpers {
             Ok(())
         }
 
+        fn store_del(&mut self, key: &str) -> Result<(), String> {
+            self.store.remove(key);
+            Ok(())
+        }
+
         fn http_fetch(
             &mut self,
             request: &HttpRequest,
@@ -293,11 +361,19 @@ pub(crate) mod test_helpers {
                 .expect("unexpected HTTP request")
         }
 
-        fn sign_hash(&mut self, request: &SignRequest) -> Result<SignHashOutcome, String> {
+        fn sign_payload(&mut self, request: &PayloadSignRequest) -> Result<SignOutcome, String> {
             self.sign_requests.push(request.clone());
             self.sign_results
                 .pop_front()
                 .expect("unexpected signing request")
+        }
+
+        fn package_hash(&self) -> &str {
+            "test-package-hash"
+        }
+
+        fn route_id(&self) -> &str {
+            "test/route.json"
         }
 
         fn now_ms(&mut self) -> Result<u64, String> {
@@ -313,16 +389,15 @@ pub(crate) mod test_helpers {
         }
     }
 
-    pub(crate) fn signature() -> SignHashOutcome {
+    pub(crate) fn signature() -> SignOutcome {
         let mut bytes = vec![0xab; 65];
         bytes[64] = 27;
-        SignHashOutcome::Signature(bytes)
+        SignOutcome::Signature(bytes)
     }
 
-    pub(crate) fn approval() -> SignHashOutcome {
-        SignHashOutcome::ApprovalRequired {
+    pub(crate) fn approval() -> SignOutcome {
+        SignOutcome::ApprovalPending {
             action_id: "approval-1".into(),
-            ceremony_url: "http://127.0.0.1/approve/approval-1".into(),
             expires_ms: 1_500_000,
         }
     }

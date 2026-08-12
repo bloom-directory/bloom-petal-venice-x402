@@ -3,12 +3,23 @@
 //! All HTTP calls go through the `Host` trait so tests can inject mocks.
 //! SIWE auth and x402 payment headers are added per-request.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::common::{self, DispatchResponse, Host, MAX_BODY, VENICE_API};
 use crate::siwe;
 use crate::types::{BalanceView, ChatRequest};
 use crate::x402;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PendingTopUp {
+    wallet: String,
+    address: String,
+    amount_base_units: String,
+    prepared: x402::PreparedPayment,
+    approval_action_id: Option<String>,
+    approval_expires_ms: Option<u64>,
+}
 
 // ---------------------------------------------------------------------------
 // Low-level HTTP helpers
@@ -22,7 +33,7 @@ fn authed_get<H: Host>(
     path: &str,
 ) -> Result<Value, DispatchResponse> {
     let url = format!("{VENICE_API}{path}");
-    let session = siwe::get_or_create_session(host, wallet, address, &url)?;
+    let session = siwe::get_or_create_session(host, wallet, address, &url, "venice-x402.balance")?;
     let request = petal::HttpRequest {
         method: "GET".into(),
         url,
@@ -181,67 +192,93 @@ pub(crate) fn top_up<H: Host>(
     }
     let amount_base_units_str = amount_base_units.to_string();
 
-    // Step 1: initiate top-up to get payment requirements.
-    // Per Venice's x402 spec the initial /x402/top-up request takes no auth
-    // header; the payment is authorized via X-402-Payment on the retry.
-    let init_request = petal::HttpRequest {
-        method: "POST".into(),
-        url: format!("{VENICE_API}/x402/top-up"),
-        headers: vec![("content-type".into(), "application/json".into())],
-        body: serde_json::to_vec(&json!({}))
-            .map_err(|e| common::backend(format!("serialize top-up body: {e}")))?,
-    };
-    let init_response = host
-        .http_fetch(&init_request, MAX_BODY)
-        .map_err(common::backend)?;
-
-    if init_response.status != 402 {
-        // Unexpected — could be already sufficient or an error.
-        let body = common::parse_json_body(&init_response).unwrap_or(Value::Null);
-        if (200..300).contains(&init_response.status) {
-            return Err(common::invalid(
-                "Venice did not require payment for top-up — balance may already be sufficient",
-            ));
-        }
-        return Err(common::backend(format!(
-            "Venice top-up initiation returned HTTP {}: {}",
-            init_response.status,
-            common::compact(&body)
-        )));
-    }
-
-    // Parse the 402 payment requirements.
-    let required: x402::PaymentRequired = serde_json::from_slice(&init_response.body)
-        .map_err(|e| common::backend(format!("parse 402 payment requirements: {e}")))?;
-    let requirement = x402::extract_base_requirement(&required)?;
-
-    // Step 2: enforce Venice's minimum top-up. `requirement.amount` is the
-    // minimum in USDC base units (6 decimals), not the amount charged.
-    let minimum_base_units: u64 = requirement.amount.parse().map_err(|_| {
-        common::backend(format!(
-            "Venice 402 requirement has a non-numeric amount: {}",
-            requirement.amount
-        ))
-    })?;
-    if amount_base_units < minimum_base_units {
-        let minimum_usd = (minimum_base_units as f64) / 1_000_000.0;
-        return Err(common::invalid(format!(
-            "amount_usd must be at least ${minimum_usd:.2}"
-        )));
-    }
-
-    // Step 3: build and sign the x402 payment header for the requested amount.
     let now_ms = host.now_ms().map_err(common::backend)?;
     let now_secs = now_ms / 1000;
-    let payment_header = x402::build_payment_header(
+    let pending_key = format!("state/topups/{wallet}.pending.json");
+    let stored_pending =
+        match host
+            .store_get(&pending_key, crate::common::MAX_STORED)
+            .map_err(common::backend)?
+        {
+            Some(bytes) => Some(serde_json::from_slice::<PendingTopUp>(&bytes).map_err(
+                |error| common::backend(format!("stored pending top-up is invalid: {error}")),
+            )?),
+            None => None,
+        };
+    let mut pending = match stored_pending {
+        Some(pending) => {
+            let valid_before = pending
+                .prepared
+                .authorization
+                .valid_before
+                .parse::<u64>()
+                .map_err(|_| common::backend("stored top-up validity is invalid"))?;
+            if valid_before <= now_secs.saturating_add(30) {
+                host.store_del(&pending_key).map_err(common::backend)?;
+                prepare_top_up(
+                    host,
+                    wallet,
+                    address,
+                    &amount_base_units_str,
+                    amount_base_units,
+                    now_secs,
+                )?
+            } else {
+                if pending.wallet != wallet
+                    || !pending.address.eq_ignore_ascii_case(address)
+                    || pending.amount_base_units != amount_base_units_str
+                {
+                    return Err(common::invalid(
+                        "a different top-up is already awaiting completion for this wallet",
+                    ));
+                }
+                pending
+            }
+        }
+        None => prepare_top_up(
+            host,
+            wallet,
+            address,
+            &amount_base_units_str,
+            amount_base_units,
+            now_secs,
+        )?,
+    };
+    let pending_bytes = serde_json::to_vec(&pending)
+        .map_err(|error| common::backend(format!("serialize pending top-up: {error}")))?;
+    host.store_put(&pending_key, &pending_bytes, false)
+        .map_err(common::backend)?;
+
+    let approval_hint = pending
+        .approval_expires_ms
+        .is_some_and(|expires_ms| expires_ms > now_ms)
+        .then(|| pending.approval_action_id.clone())
+        .flatten();
+    let payment_header = match x402::sign_payment_header(
         host,
         wallet,
-        address,
-        requirement,
-        &amount_base_units_str,
-        required.x402_version,
-        now_secs,
-    )?;
+        &pending.prepared,
+        approval_hint,
+    )? {
+        x402::PaymentSignOutcome::Header(header) => header,
+        x402::PaymentSignOutcome::ApprovalPending {
+            action_id,
+            expires_ms,
+        } => {
+            pending.approval_action_id = Some(action_id.clone());
+            pending.approval_expires_ms = Some(expires_ms);
+            let bytes = serde_json::to_vec(&pending)
+                .map_err(|error| common::backend(format!("serialize pending top-up: {error}")))?;
+            host.store_put(&pending_key, &bytes, false)
+                .map_err(common::backend)?;
+            return Err(petal::error(
+                -2,
+                format!(
+                    "x402 payment approval required for action {action_id}; open the owner-visible Bloom signing request, approve it, then retry the exact write"
+                ),
+            ));
+        }
+    };
 
     // Step 4: retry top-up with payment header.
     let retry_request = petal::HttpRequest {
@@ -270,8 +307,73 @@ pub(crate) fn top_up<H: Host>(
     // balance reflects reality regardless of the exact envelope.
     let balance_usd =
         field_string(&result, "balanceUsd").or_else(|| field_string(&result, "newBalance"));
+    host.store_del(&pending_key).map_err(common::backend)?;
 
     Ok((amount_base_units_str, balance_usd))
+}
+
+fn prepare_top_up<H: Host>(
+    host: &mut H,
+    wallet: &str,
+    address: &str,
+    amount_base_units_str: &str,
+    amount_base_units: u64,
+    now_secs: u64,
+) -> Result<PendingTopUp, DispatchResponse> {
+    let init_request = petal::HttpRequest {
+        method: "POST".into(),
+        url: format!("{VENICE_API}/x402/top-up"),
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: serde_json::to_vec(&json!({}))
+            .map_err(|error| common::backend(format!("serialize top-up body: {error}")))?,
+    };
+    let init_response = host
+        .http_fetch(&init_request, MAX_BODY)
+        .map_err(common::backend)?;
+    if init_response.status != 402 {
+        let body = common::parse_json_body(&init_response).unwrap_or(Value::Null);
+        if (200..300).contains(&init_response.status) {
+            return Err(common::invalid(
+                "Venice did not require payment for top-up — balance may already be sufficient",
+            ));
+        }
+        return Err(common::backend(format!(
+            "Venice top-up initiation returned HTTP {}: {}",
+            init_response.status,
+            common::compact(&body)
+        )));
+    }
+    let required: x402::PaymentRequired = serde_json::from_slice(&init_response.body)
+        .map_err(|error| common::backend(format!("parse 402 payment requirements: {error}")))?;
+    let requirement = x402::extract_base_requirement(&required)?;
+    let minimum_base_units: u64 = requirement.amount.parse().map_err(|_| {
+        common::backend(format!(
+            "Venice 402 requirement has a non-numeric amount: {}",
+            requirement.amount
+        ))
+    })?;
+    if amount_base_units < minimum_base_units {
+        let minimum_usd = (minimum_base_units as f64) / 1_000_000.0;
+        return Err(common::invalid(format!(
+            "amount_usd must be at least ${minimum_usd:.2}"
+        )));
+    }
+    let prepared = x402::prepare_payment(
+        host,
+        address,
+        requirement,
+        amount_base_units_str,
+        required.x402_version,
+        now_secs,
+    )?;
+    Ok(PendingTopUp {
+        wallet: wallet.to_owned(),
+        address: address.to_owned(),
+        amount_base_units: amount_base_units_str.to_owned(),
+        prepared,
+        approval_action_id: None,
+        approval_expires_ms: None,
+    })
 }
 
 /// Send a chat completion request.
@@ -290,7 +392,7 @@ pub(crate) fn chat_completion_raw<H: Host>(
     }
 
     let url = format!("{VENICE_API}/chat/completions");
-    let session = siwe::get_or_create_session(host, wallet, address, &url)?;
+    let session = siwe::get_or_create_session(host, wallet, address, &url, "venice-x402.chat")?;
 
     // Venice's chat API is OpenAI-compatible: system context goes in the
     // messages array as a {role:"system"} message, not a top-level field.
@@ -435,6 +537,7 @@ pub fn topup_store_key(wallet: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::test_helpers::test_nonce;
     use crate::common::test_helpers::{MockHost, signature};
     use crate::types::{ChatMessage, ChatRequest};
     use petal::HttpResponse;
@@ -723,7 +826,7 @@ mod tests {
         assert_eq!(amount_base_units, "10000000");
         assert_eq!(balance_usd.as_deref(), Some("15.00"));
         assert_eq!(host.sign_requests.len(), 1);
-        assert_eq!(host.sign_requests[0].purpose, "venice-x402.topup");
+        assert_eq!(host.sign_requests[0].operation_class, "venice-x402.topup");
 
         // The retry carried the X-402-Payment header; the init did not.
         assert_eq!(host.requests.len(), 2);
@@ -742,6 +845,62 @@ mod tests {
             .find(|(k, _)| k.eq_ignore_ascii_case("x-402-payment"))
             .expect("retry must carry X-402-Payment");
         assert!(!payment.1.is_empty());
+    }
+
+    #[test]
+    fn top_up_approval_retry_reuses_prepared_authorization_and_hint() {
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        host.random_data.push_back(test_nonce());
+        host.sign_results
+            .push_back(Ok(petal::SignOutcome::ApprovalPending {
+                action_id: "approval-1".into(),
+                expires_ms: 1_700_000_060_000,
+            }));
+        host.sign_results.push_back(Ok(signature()));
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 402,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({
+                "x402Version": 2,
+                "accepts": [{
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                    "amount": "5000000",
+                    "payTo": "0x2670b922ef37c7df47158725c0cc407b5382293f",
+                    "maxTimeoutSeconds": 300,
+                    "extra": {"name": "USD Coin", "version": "2"}
+                }]
+            }))
+            .unwrap(),
+        }));
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({"balanceUsd": "15.00"})).unwrap(),
+        }));
+
+        assert!(top_up(&mut host, "minnow-passkey", ADDRESS, "10.00").is_err());
+        let completed = top_up(&mut host, "minnow-passkey", ADDRESS, "10.00").unwrap();
+
+        assert_eq!(completed.0, "10000000");
+        assert_eq!(host.sign_requests.len(), 2);
+        assert_eq!(
+            host.sign_requests[0].preimage,
+            host.sign_requests[1].preimage
+        );
+        assert_eq!(
+            host.sign_requests[0].claimed_hash,
+            host.sign_requests[1].claimed_hash
+        );
+        assert_eq!(
+            host.sign_requests[1].approval_hint.as_deref(),
+            Some("approval-1")
+        );
+        assert_eq!(host.requests.len(), 2, "retry must not fetch a fresh quote");
     }
 
     #[test]

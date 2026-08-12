@@ -35,6 +35,7 @@ pub fn wallet_address(wallet: &str) -> Result<String, petal::DispatchResponse> {
 
 /// Execute a chat completion request and persist the result.
 pub fn venice_chat(
+    ctx: &petal::Ctx,
     wallet: &str,
     address: &str,
     chat_id: &str,
@@ -42,7 +43,10 @@ pub fn venice_chat(
 ) -> petal::DispatchResponse {
     use common::Host;
 
-    let mut host = common::BloomHost;
+    let mut host = match common::BloomHost::new(ctx) {
+        Ok(host) => host,
+        Err(response) => return response,
+    };
     let (value, balance_remaining) =
         match venice::chat_completion_raw(&mut host, wallet, address, &request) {
             Ok(result) => result,
@@ -78,10 +82,18 @@ pub fn venice_chat(
 }
 
 /// Execute an x402 top-up and persist the result.
-pub fn venice_topup(wallet: &str, address: &str, request: TopUpRequest) -> petal::DispatchResponse {
+pub fn venice_topup(
+    ctx: &petal::Ctx,
+    wallet: &str,
+    address: &str,
+    request: TopUpRequest,
+) -> petal::DispatchResponse {
     use common::Host;
 
-    let mut host = common::BloomHost;
+    let mut host = match common::BloomHost::new(ctx) {
+        Ok(host) => host,
+        Err(response) => return response,
+    };
     let (amount_base_units, balance_usd) =
         match venice::top_up(&mut host, wallet, address, &request.amount_usd) {
             Ok(result) => result,
@@ -112,17 +124,35 @@ pub fn venice_topup(wallet: &str, address: &str, request: TopUpRequest) -> petal
 }
 
 /// Fetch balance view for the wallet.
-pub fn venice_balance(wallet: &str, address: &str) -> petal::DispatchResponse {
-    let mut host = common::BloomHost;
+pub fn venice_balance(ctx: &petal::Ctx, wallet: &str, address: &str) -> petal::DispatchResponse {
+    use common::Host;
+
+    let mut host = match common::BloomHost::new(ctx) {
+        Ok(host) => host,
+        Err(response) => return response,
+    };
     match venice::check_balance(&mut host, wallet, address) {
-        Ok(view) => petal::read_json_value(&view),
+        Ok(view) => {
+            let key = format!("state/balance/{wallet}.json");
+            let bytes = match serde_json::to_vec_pretty(&view) {
+                Ok(bytes) => bytes,
+                Err(error) => return common::backend(format!("serialize balance: {error}")),
+            };
+            if let Err(error) = host.store_put(&key, &bytes, false) {
+                return common::backend(error);
+            }
+            petal::read_store(&key, common::MAX_STORED)
+        }
         Err(response) => response,
     }
 }
 
 /// Fetch Venice models list (no auth required).
 pub fn venice_models() -> petal::DispatchResponse {
-    let mut host = common::BloomHost;
+    let mut host = common::BloomHost {
+        package_hash: String::new(),
+        route_id: String::new(),
+    };
     match venice::list_models(&mut host) {
         Ok(value) => petal::read_json_value(&value),
         Err(response) => response,
