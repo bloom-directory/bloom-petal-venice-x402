@@ -43,7 +43,7 @@ jobs:
         run: cargo install wasm-tools --locked
 
       - name: Install petal CLI
-        run: cargo install --git https://github.com/bloom-directory/petal bloom-petal-cli --locked
+        run: cargo install --git https://github.com/bloom-directory/petal --rev b9fc22d6d8211bc41304b38b1ef8b5269c8035bd bloom-petal-cli --locked
 
       - name: Petal build (route-file compile gate)
         run: bash scripts/build-petal.sh
