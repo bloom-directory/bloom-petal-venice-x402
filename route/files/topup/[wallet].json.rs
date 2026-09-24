@@ -44,6 +44,6 @@ petal::route_file!(
         if !crate::is_evm_address(&request.address) {
             return petal::error(-3, "address must be a valid EVM address");
         }
-        crate::venice_topup(&wallet, &address, request)
+        crate::venice_topup(ctx, &wallet, &address, request)
     },
 );
