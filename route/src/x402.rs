@@ -396,20 +396,21 @@ mod tests {
 
     /// An empty claim would present the top-up as valueless, leaving Broker's
     /// value and destination limits nothing to bind to. The fixture uses
-    /// checksummed addresses, as a 402 response may: Broker compares a
-    /// declared destination to the policy's entries byte for byte, so they
-    /// have to reach the claim lowercased.
+    /// EIP-55 checksummed addresses, the form a 402 response normally
+    /// carries, because EIP-55 encodes its checksum in the letter case.
+    /// Broker compares a declared destination to the policy's entries byte
+    /// for byte, so they have to reach the claim lowercased.
     #[test]
     fn topup_claim_declares_the_usdc_debit_and_the_payee() {
         let mut host = MockHost::default();
         host.sign_results.push_back(Ok(signature()));
         let mut requirement = base_requirement();
-        requirement.asset = "0x833589FCD6EDB6E08F4C7C32D4F71B54BDA02913".into();
+        requirement.asset = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into();
         let prepared = PreparedPayment {
             requirement,
             authorization: Eip3009Authorization {
                 from: ADDRESS.into(),
-                to: "0x2670B922EF37C7DF47158725C0CC407B5382293F".into(),
+                to: "0x2670B922ef37C7Df47158725C0CC407b5382293F".into(),
                 value: "5000000".into(),
                 valid_after: "0".into(),
                 valid_before: "9999999999".into(),
