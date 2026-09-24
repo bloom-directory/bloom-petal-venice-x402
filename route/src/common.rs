@@ -9,7 +9,7 @@ use petal::{
     HostStatus, HttpRequest, HttpResponse, PayloadSignItem, PayloadSignRequest, SdkError,
     SignOutcome, SignSelector,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 pub(crate) use petal::DispatchResponse;
@@ -143,6 +143,45 @@ impl Host for BloomHost {
     }
 }
 
+/// What a signature lets the wallet spend, and where that value may go.
+///
+/// Broker derives an approval's value limits from `declared_debits` and checks
+/// each `declared_destination` against the wallet policy, so declaring nothing
+/// leaves both with nothing to bind to.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ClaimEffects {
+    declared_debits: Vec<Value>,
+    declared_destinations: Vec<Value>,
+}
+
+impl ClaimEffects {
+    /// Only for a signature that truly moves nothing, such as a SIWE login.
+    pub(crate) fn none() -> Self {
+        Self {
+            declared_debits: Vec::new(),
+            declared_destinations: Vec::new(),
+        }
+    }
+
+    /// An EIP-3009 authorization: the payee may pull exactly `amount` base
+    /// units of `token`. Both addresses are lowercased because Broker compares
+    /// a destination to the policy's entries byte for byte.
+    pub(crate) fn usdc_authorization(token: &str, payee: &str, amount_base_units: &str) -> Self {
+        Self {
+            declared_debits: vec![json!({
+                "asset": {"chain": "base", "asset": token.to_ascii_lowercase()},
+                "amount": amount_base_units,
+            })],
+            declared_destinations: vec![json!({
+                "chain": "base",
+                "destination": payee.to_ascii_lowercase(),
+            })],
+        }
+    }
+}
+
+// One signing request; a parameter struct would only move the list elsewhere.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn request_payload_signature(
     host: &mut impl Host,
     wallet: &str,
@@ -151,6 +190,7 @@ pub(crate) fn request_payload_signature(
     operation_class: &str,
     approval_hint: Option<String>,
     action: Option<Vec<u8>>,
+    effects: ClaimEffects,
 ) -> Result<SignOutcome, String> {
     let payload_digest = petal::payload_batch_digest(&[PayloadSignItem {
         preimage: preimage.clone(),
@@ -173,8 +213,8 @@ pub(crate) fn request_payload_signature(
         "crypto_suite": "secp256k1-keccak256-recoverable",
         "payload_digest": hex::encode(payload_digest),
         "ordered_hashes": [hex::encode(claimed_hash)],
-        "declared_debits": [],
-        "declared_destinations": [],
+        "declared_debits": effects.declared_debits,
+        "declared_destinations": effects.declared_destinations,
         "declared_fee": {"kind": "none"},
         "nonce": hex::encode(&nonce[..16]),
         "claim_assurance": {"kind": "machine_asserted"}

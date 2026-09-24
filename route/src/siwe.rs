@@ -250,6 +250,8 @@ pub(crate) fn get_or_create_session(
             .then(|| pending.approval_action_id.clone())
             .flatten(),
         Some(message.as_bytes().to_vec()),
+        // A SIWE login proves who holds the wallet; it moves nothing.
+        common::ClaimEffects::none(),
     )
     .map_err(common::backend)?;
 
