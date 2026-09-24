@@ -61,6 +61,6 @@ petal::route_file!(
             Ok(request) => request,
             Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
         };
-        crate::venice_chat(&wallet, &address, &id, request)
+        crate::venice_chat(ctx, &wallet, &address, &id, request)
     },
 );
