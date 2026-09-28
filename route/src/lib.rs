@@ -105,7 +105,11 @@ pub fn venice_chat(
         return common::backend(e);
     }
 
-    petal::read_store(&key, common::MAX_STORED)
+    // A write answers with a write; the result is read back with a GET on
+    // this same route. Returning the stored body from a write makes the
+    // Machine reject it as `write returned non-write response` *after* the
+    // work has already been done.
+    petal::DispatchResponse::Write
 }
 
 /// Execute an x402 top-up and persist the result.
@@ -147,7 +151,11 @@ pub fn venice_topup(
         return common::backend(e);
     }
 
-    petal::read_store(&key, common::MAX_STORED)
+    // A write answers with a write. Returning the stored body here made the
+    // Machine reject a *settled* top-up as `write returned non-write
+    // response`, so a completed payment reported failure and invited the
+    // caller to pay a second time. The result is read back with a GET.
+    petal::DispatchResponse::Write
 }
 
 /// Fetch balance view for the wallet.
@@ -168,7 +176,9 @@ pub fn venice_balance(ctx: &petal::Ctx, wallet: &str, address: &str) -> petal::D
             if let Err(error) = host.store_put(&key, &bytes, false) {
                 return common::backend(error);
             }
-            petal::read_store(&key, common::MAX_STORED)
+            // As above: a write answers with a write, and the refreshed
+            // view is read back with a GET.
+            petal::DispatchResponse::Write
         }
         Err(response) => response,
     }
