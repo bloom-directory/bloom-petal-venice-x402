@@ -281,10 +281,19 @@ pub(crate) fn top_up<H: Host>(
     };
 
     // Step 4: retry top-up with payment header.
+    //
+    // The retry carries a JSON body like the init did, so it needs the same
+    // content type. Venice answers a POST without it with HTTP 400 and never
+    // looks at the payment header, which strands an already-signed
+    // authorization: the wallet has committed to the transfer and gets
+    // nothing back for it.
     let retry_request = petal::HttpRequest {
         method: "POST".into(),
         url: format!("{VENICE_API}/x402/top-up"),
-        headers: vec![("X-402-Payment".into(), payment_header)],
+        headers: vec![
+            ("content-type".into(), "application/json".into()),
+            ("X-402-Payment".into(), payment_header),
+        ],
         body: serde_json::to_vec(&json!({}))
             .map_err(|e| common::backend(format!("serialize retry body: {e}")))?,
     };
@@ -845,6 +854,18 @@ mod tests {
             .find(|(k, _)| k.eq_ignore_ascii_case("x-402-payment"))
             .expect("retry must carry X-402-Payment");
         assert!(!payment.1.is_empty());
+
+        // Both requests send a JSON body, so both must say so. Venice rejects
+        // a POST without it before reading the payment header, which wastes a
+        // signature the wallet has already authorized.
+        for (label, request) in [("init", init), ("retry", retry)] {
+            let content_type = request
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .unwrap_or_else(|| panic!("{label} must carry Content-Type"));
+            assert_eq!(content_type.1, "application/json", "{label}");
+        }
     }
 
     #[test]

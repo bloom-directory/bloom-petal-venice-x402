@@ -164,8 +164,14 @@ impl ClaimEffects {
     }
 
     /// An EIP-3009 authorization: the payee may pull exactly `amount` base
-    /// units of `token`. Both addresses are lowercased because Broker compares
-    /// a destination to the policy's entries byte for byte.
+    /// units of `token`.
+    ///
+    /// Both addresses are lowercased so one account always yields one declared
+    /// spelling, whatever case the 402 response happened to use, and the owner
+    /// reviews and signs the same text every time. It is deliberately not a
+    /// matching device: how a destination compares against a wallet policy is
+    /// Broker's decision under its own rules, and a Petal cannot see which
+    /// spelling that policy holds.
     pub(crate) fn usdc_authorization(token: &str, payee: &str, amount_base_units: &str) -> Self {
         Self {
             declared_debits: vec![json!({
