@@ -31,9 +31,9 @@ route/
 ├── files/
 │   ├── status.json.rs              — Static petal health endpoint
 │   ├── models.json.rs              — Proxy to Venice's public models list
-│   ├── balance/[wallet].json.rs    — Explicit refresh write + cached balance read
-│   ├── topup/[wallet].json.rs      — Top-up handler (SIWE + EIP-3009 payment)
-│   ├── chat/[wallet]/[id].json.rs  — Chat completion handler (SIWE auth)
+│   ├── balance/[wallet]/[index].json.rs — Explicit refresh write + cached balance read
+│   ├── topup/[wallet]/[index].json.rs   — Top-up handler (SIWE + EIP-3009 payment)
+│   ├── chat/[wallet]/[index]/[id].json.rs  — Chat completion handler (SIWE auth)
 │   └── $index.rs                   — Directory listing
 └── tests/
     └── integration.rs              — 16 public API tests

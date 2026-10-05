@@ -58,6 +58,31 @@ errors and a stale `petal-build.toml`. CI runs all five on every PR.
 | `MAX_BODY` | `512 * 1024` | Max HTTP response body |
 | `MAX_STORED` | `1024 * 1024` | Max stored value size (fits a max-size chat result) |
 
+## Wallet and account
+
+Every wallet-scoped route declares adjacent `[wallet]/[index]` captures, and
+the Petal spends from the account the caller named:
+
+```
+balance/<wallet>/<index>.json
+topup/<wallet>/<index>.json
+chat/<wallet>/<index>/<id>.json
+```
+
+bloom#328 refuses a wallet-scoped route that names `[wallet]` alone, so there
+is no account-zero default to fall back to and nothing for the Petal to guess.
+The owner address is read from `wallets/<wallet>/<index>/address.evm`, and that
+same address is the `from` of the EIP-3009 authorization the top-up signs — so
+the account the caller selects is the account that pays.
+
+Both captures are validated before they reach a VFS path. The index must be a
+plain decimal account number with no leading zero, since `01` and `1` would
+otherwise be two spellings of one account and only one is a path Bloom serves.
+
+Bloom gives each selected account its own private store, so the Petal's store
+keys are unchanged and a session or balance cached for one account is not
+visible to another.
+
 ## Dependency Pinning
 
 `petal-build.toml` pins `alloy-dyn-abi = "=1.6"` to prevent ABI-encoding-breaking patch releases. Do not bump without verifying EIP-712 hash compatibility.
