@@ -57,16 +57,17 @@ Public proxy to Venice's model list. Cached for 60 seconds. No auth required.
 ### `GET /status.json`
 Static health check endpoint. Returns petal name and version.
 
-### `GET /balance/{wallet}.json`
-Reads the last known balance from the state store. Wallet alias is validated as a safe path segment.
+### `GET /balance/{wallet}/{index}.json`
+Reads the last known balance from the state store. The wallet alias is validated as a
+safe path segment and `{index}` as the account number Bloom selected.
 On a fresh install this returns not found until the balance has been refreshed.
 
-### `POST /balance/{wallet}.json`
+### `POST /balance/{wallet}/{index}.json`
 Refreshes the cached balance. Write either an empty body or `{}`. The wallet signs
 the `venice-x402.balance` SIWE intent through Bloom's owner-visible approval flow;
 after approval, retry the identical write and then read the route with `GET`.
 
-### `POST /topup/{wallet}.json`
+### `POST /topup/{wallet}/{index}.json`
 Initiates an x402 top-up. Requires a signed request with:
 ```json
 {
@@ -76,7 +77,7 @@ Initiates an x402 top-up. Requires a signed request with:
 ```
 The wallet signs the `venice-x402.topup` intent. The petal constructs and signs an EIP-3009 payment authorization.
 
-### `POST /chat/{wallet}/{id}.json`
+### `POST /chat/{wallet}/{index}/{id}.json`
 Sends a chat completion request. Requires a signed request with:
 ```json
 {
