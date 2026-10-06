@@ -6,34 +6,22 @@ petal::route_file!(
         "bloom:vfs.read",
     ]),
     read: |ctx: &petal::Ctx| {
-        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
-            if petal::is_safe_segment(value) && value.len() <= 128 {
-                Ok(value)
-            } else {
-                Err(petal::error(-3, "wallet alias is unsafe"))
-            }
-        }) {
-            Ok(wallet) => wallet,
+        let (wallet, _index) = match crate::wallet_and_index(ctx) {
+            Ok(captured) => captured,
             Err(response) => return response,
         };
-        let key = crate::topup_store_key(wallet);
+        let key = crate::topup_store_key(&wallet);
         petal::read_store(&key, crate::MAX_STORED)
     },
     write: |ctx: &petal::Ctx, body: &[u8]| {
         if body.len() > 4 * 1024 {
             return petal::error(-3, "request body is too large");
         }
-        let wallet = match petal::param(ctx, "wallet").and_then(|value| {
-            if petal::is_safe_segment(value) && value.len() <= 128 {
-                Ok(value.to_owned())
-            } else {
-                Err(petal::error(-3, "wallet alias is unsafe"))
-            }
-        }) {
-            Ok(wallet) => wallet,
+        let (wallet, index) = match crate::wallet_and_index(ctx) {
+            Ok(captured) => captured,
             Err(response) => return response,
         };
-        let address = match crate::wallet_address(&wallet) {
+        let address = match crate::wallet_address(&wallet, &index) {
             Ok(address) => address,
             Err(response) => return response,
         };
@@ -44,6 +32,6 @@ petal::route_file!(
         if !crate::is_evm_address(&request.address) {
             return petal::error(-3, "address must be a valid EVM address");
         }
-        crate::venice_topup(&wallet, &address, request)
+        crate::venice_topup(ctx, &wallet, &address, request)
     },
 );
