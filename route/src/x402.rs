@@ -635,6 +635,15 @@ mod tests {
         // Should have signed exactly once.
         assert_eq!(host.sign_requests.len(), 1);
         assert_eq!(host.sign_requests[0].operation_class, "venice-x402.topup");
+        let review: Value =
+            serde_json::from_slice(host.sign_requests[0].action.as_ref().unwrap()).unwrap();
+        assert_eq!(review["schema"], "bloom.message.review.v1");
+        assert_eq!(review["typed_data"]["message"]["value"], "10000000");
+        let typed: TypedData = serde_json::from_value(review["typed_data"].clone()).unwrap();
+        let mut reviewed = vec![0x19, 0x01];
+        reviewed.extend_from_slice(typed.domain().separator().as_slice());
+        reviewed.extend_from_slice(typed.hash_struct().unwrap().as_slice());
+        assert_eq!(reviewed, host.sign_requests[0].preimage);
     }
 
     #[test]

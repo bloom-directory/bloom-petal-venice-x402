@@ -512,6 +512,15 @@ mod tests {
 
         assert!(!session.header_b64.is_empty());
         assert_eq!(host.sign_requests.len(), 2);
+        let review: serde_json::Value =
+            serde_json::from_slice(host.sign_requests[0].action.as_ref().unwrap()).unwrap();
+        assert_eq!(review["schema"], "bloom.message.review.v1");
+        assert_eq!(review["kind"], "personal");
+        assert_eq!(
+            eip191_signing_preimage(review["message"].as_str().unwrap()),
+            host.sign_requests[0].preimage
+        );
+        assert_eq!(host.sign_requests[0].action, host.sign_requests[1].action);
         assert_eq!(
             host.sign_requests[0].preimage,
             host.sign_requests[1].preimage
