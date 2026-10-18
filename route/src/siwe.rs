@@ -249,8 +249,12 @@ pub(crate) fn get_or_create_session(
             .is_some_and(|expires_ms| expires_ms > now_ms)
             .then(|| pending.approval_action_id.clone())
             .flatten(),
-        Some(message.as_bytes().to_vec()),
-        // A SIWE login proves who holds the wallet; it moves nothing.
+        Some(
+            serde_json::to_vec(&serde_json::json!({
+                "schema":"bloom.message.review.v1", "kind":"personal", "message":message
+            }))
+            .map_err(|error| common::backend(format!("cannot encode login review: {error}")))?,
+        ),
         common::ClaimEffects::none(),
     )
     .map_err(common::backend)?;

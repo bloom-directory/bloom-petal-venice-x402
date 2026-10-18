@@ -128,6 +128,7 @@ pub(crate) fn eip712_signing_hash(
     Ok(alloy_primitives::keccak256(preimage).into())
 }
 
+#[cfg(test)]
 pub(crate) fn eip712_signing_preimage(
     auth: &Eip3009Authorization,
     chain_id: u64,
@@ -135,6 +136,23 @@ pub(crate) fn eip712_signing_preimage(
     token_name: &str,
     token_version: &str,
 ) -> Result<Vec<u8>, String> {
+    signing_payment(
+        auth,
+        chain_id,
+        verifying_contract,
+        token_name,
+        token_version,
+    )
+    .map(|payment| payment.0)
+}
+
+fn signing_payment(
+    auth: &Eip3009Authorization,
+    chain_id: u64,
+    verifying_contract: &str,
+    token_name: &str,
+    token_version: &str,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut types = Map::new();
     types.insert(
         "EIP712Domain".into(),
@@ -150,7 +168,7 @@ pub(crate) fn eip712_signing_preimage(
         authorization_types()["TransferWithAuthorization"].clone(),
     );
 
-    let typed: TypedData = serde_json::from_value(json!({
+    let typed_data = json!({
         "types": types,
         "primaryType": "TransferWithAuthorization",
         // `chainId` is a JSON number (EIP-712 domain types it as uint256).
@@ -170,8 +188,9 @@ pub(crate) fn eip712_signing_preimage(
             "validBefore": auth.valid_before,
             "nonce": auth.nonce
         }
-    }))
-    .map_err(|e| format!("invalid EIP-712 typed data: {e}"))?;
+    });
+    let typed: TypedData = serde_json::from_value(typed_data.clone())
+        .map_err(|e| format!("invalid EIP-712 typed data: {e}"))?;
 
     let mut preimage = Vec::with_capacity(66);
     preimage.extend_from_slice(&[0x19, 0x01]);
@@ -182,7 +201,11 @@ pub(crate) fn eip712_signing_preimage(
             .map_err(|e| format!("cannot hash EIP-712 typed data: {e}"))?
             .as_slice(),
     );
-    Ok(preimage)
+    let review = serde_json::to_vec(&json!({
+        "schema":"bloom.message.review.v1", "kind":"eip712", "typed_data":typed_data
+    }))
+    .map_err(|error| format!("cannot encode payment review: {error}"))?;
+    Ok((preimage, review))
 }
 
 /// Extract a USDC-on-Base payment requirement from a 402 response.
@@ -311,7 +334,7 @@ pub(crate) fn sign_payment_header(
         .unwrap_or(USDC_VERSION);
 
     // Compute the EIP-712 signing hash.
-    let preimage = eip712_signing_preimage(
+    let (preimage, review) = signing_payment(
         auth,
         CHAIN_ID,
         &requirement.asset,
@@ -329,7 +352,7 @@ pub(crate) fn sign_payment_header(
         hash,
         "venice-x402.topup",
         approval_hint,
-        serde_json::to_vec(&auth).ok(),
+        Some(review),
         // The authorization is what lets Venice's payee pull USDC from the
         // wallet, so the claim has to say so: the exact value as a Base USDC
         // debit, and the payee as the destination it reaches.
