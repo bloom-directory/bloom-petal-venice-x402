@@ -377,6 +377,7 @@ pub(crate) mod test_helpers {
         pub(crate) http_results: VecDeque<Result<HttpResponse, String>>,
         pub(crate) sign_results: VecDeque<Result<SignOutcome, String>>,
         pub(crate) requests: Vec<HttpRequest>,
+        pub(crate) stores_at_http: Vec<HashMap<String, Vec<u8>>>,
         pub(crate) sign_requests: Vec<PayloadSignRequest>,
         pub(crate) now_ms: u64,
         pub(crate) random_data: VecDeque<Vec<u8>>,
@@ -418,6 +419,7 @@ pub(crate) mod test_helpers {
             _max_bytes: usize,
         ) -> Result<HttpResponse, String> {
             self.requests.push(request.clone());
+            self.stores_at_http.push(self.store.clone());
             self.http_results
                 .pop_front()
                 .expect("unexpected HTTP request")

@@ -76,6 +76,16 @@ Initiates an x402 top-up. Requires a signed request with:
 ```
 The wallet signs the `venice-x402.topup` intent. The petal constructs and signs an EIP-3009 payment authorization.
 
+After a payment POST may have reached Venice, a timeout, non-success response
+or unreadable reply leaves `topup.json` at `submission_unknown`, with its public
+authorization nonce, recipient, amount and expiry. Reads do not spend. Retry
+cannot sign, submit or replace that payment, even after expiry; reconcile it
+with Venice and on-chain settlement before another top-up. Provider error
+bodies and replayable payment headers are not exposed. Pending records from
+older packages lack proof that no submission occurred and receive the same
+conservative treatment. Reconcile pending payments with the installed package
+before upgrading; preserve its private records until the outcome is known.
+
 ### `POST /accounts/{wallet}/{index}/chat/{id}.json`
 Sends a chat completion request. Requires a signed request with:
 ```json

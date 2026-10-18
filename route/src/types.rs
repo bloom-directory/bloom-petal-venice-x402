@@ -83,6 +83,10 @@ pub struct TopUpRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StoredTopUp {
     pub wallet: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_nonce: Option<String>,
     /// Amount topped up in USD.
     pub amount_usd: String,
     /// USDC base units paid.

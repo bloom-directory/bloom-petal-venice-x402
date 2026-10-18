@@ -54,7 +54,7 @@ pub fn wallet_and_index(ctx: &petal::Ctx) -> Result<(String, String), petal::Dis
 fn is_account_index(value: &str) -> bool {
     value
         .parse::<u32>()
-        .is_ok_and(|number| number.to_string() == value)
+        .is_ok_and(|number| number < (1_u32 << 31) && number.to_string() == value)
 }
 
 /// Where a wallet account's EVM address lives in the VFS.
@@ -156,8 +156,6 @@ pub fn venice_topup(
     address: &str,
     request: TopUpRequest,
 ) -> petal::DispatchResponse {
-    use common::Host;
-
     if !request.address.is_empty() && !request.address.eq_ignore_ascii_case(address) {
         return common::invalid("body address differs from the path-selected account");
     }
@@ -166,30 +164,8 @@ pub fn venice_topup(
         Ok(host) => host,
         Err(response) => return response,
     };
-    let (amount_base_units, balance_usd) =
-        match venice::top_up(&mut host, wallet, address, &request.amount_usd) {
-            Ok(result) => result,
-            Err(response) => return response,
-        };
-
-    let now_ms = host.now_ms().unwrap_or(0);
-    let stored = StoredTopUp {
-        wallet: wallet.to_string(),
-        amount_usd: request.amount_usd.clone(),
-        amount_base_units,
-        status: "completed".to_string(),
-        created_ms: now_ms,
-        balance_usd,
-    };
-
-    let key = venice::topup_store_key(wallet);
-    let bytes = match serde_json::to_vec_pretty(&stored) {
-        Ok(bytes) => bytes,
-        Err(e) => return common::backend(format!("serialize top-up result: {e}")),
-    };
-
-    if let Err(e) = host.store_put(&key, &bytes, false) {
-        return common::backend(e);
+    if let Err(response) = venice::top_up(&mut host, wallet, address, &request.amount_usd) {
+        return response;
     }
 
     // A write answers with a write. Returning the stored body here made the
@@ -267,7 +243,7 @@ mod wallet_path_tests {
         // a decimal number could name another account's leaf. Leading zeros
         // are refused too: `01` and `1` would be the same account under two
         // spellings, and only one of them is a path Bloom serves.
-        for ok in ["0", "1", "12", "4294967295"] {
+        for ok in ["0", "1", "12", "2147483647"] {
             assert!(is_account_index(ok), "{ok}");
         }
         for bad in [
@@ -283,8 +259,9 @@ mod wallet_path_tests {
             " 1",
             "one",
             "٣",
-            // A u32 is what Bloom's derivation paths carry, so a larger number
-            // names no account and must not reach a VFS path.
+            // Bloom permits non-hardened account numbers below 2^31.
+            "2147483648",
+            "4294967295",
             "4294967296",
             "9999999999",
         ] {

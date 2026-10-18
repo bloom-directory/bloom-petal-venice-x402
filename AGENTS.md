@@ -78,6 +78,14 @@ the account the caller selects is the account that pays.
 Both captures are validated before they reach a VFS path. The index must be a
 plain decimal account number with no leading zero, since `01` and `1` would
 otherwise be two spellings of one account and only one is a path Bloom serves.
+The number must be below `2^31`, matching Bloom's non-hardened account range.
+
+Payment submission state is committed before HTTP. Once a POST may have
+reached Venice, preserve the exact authorization and expose only public
+recovery facts at `topup.json`; never refresh its nonce on expiry or repeat its
+signature/submission automatically. Legacy pending records without that marker
+are also unknown. Keep replayable headers and echoed provider bodies out of
+state views/errors. Reconcile uncertain payments before another top-up.
 
 Bloom gives each selected account its own private store, so the Petal's store
 keys are unchanged and a session or balance cached for one account is not

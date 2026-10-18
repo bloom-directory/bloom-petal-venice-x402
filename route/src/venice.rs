@@ -19,6 +19,33 @@ struct PendingTopUp {
     prepared: x402::PreparedPayment,
     approval_action_id: Option<String>,
     approval_expires_ms: Option<u64>,
+    /// Missing on older records: they may already have reached the payment
+    /// endpoint, so absence must never mean safe to create another nonce.
+    #[serde(default)]
+    payment_attempted: Option<bool>,
+}
+
+fn uncertain_topup() -> DispatchResponse {
+    common::backend(
+        "Venice payment outcome is unknown. Read this account's topup.json and reconcile its authorization nonce with Venice/on-chain settlement before another payment. Do not replace the pending authorization or use another account to retry.",
+    )
+}
+
+fn record_uncertain_topup<H: Host>(
+    host: &mut H,
+    pending: &PendingTopUp,
+) -> Result<(), DispatchResponse> {
+    let bytes = serde_json::to_vec(&json!({
+        "status":"submission_unknown", "wallet":pending.wallet, "address":pending.address,
+        "amount_base_units":pending.amount_base_units, "chain_id":common::CHAIN_ID,
+        "asset":pending.prepared.requirement.asset,
+        "recipient":pending.prepared.authorization.to,
+        "authorization_nonce":pending.prepared.authorization.nonce,
+        "valid_before":pending.prepared.authorization.valid_before,
+        "next":"Reconcile this authorization with Venice and on-chain settlement; do not prepare a replacement payment."
+    })).map_err(|_|common::backend("serialize payment recovery record"))?;
+    host.store_put(&topup_store_key(&pending.wallet), &bytes, false)
+        .map_err(common::backend)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +235,38 @@ pub(crate) fn top_up<H: Host>(
         };
     let mut pending = match stored_pending {
         Some(pending) => {
+            if pending.wallet != wallet
+                || !pending.address.eq_ignore_ascii_case(address)
+                || pending.amount_base_units != amount_base_units_str
+            {
+                return Err(common::invalid(
+                    "a different top-up is already awaiting completion for this wallet",
+                ));
+            }
+            if pending.payment_attempted != Some(false) {
+                // A crash can occur after the nonce-bound receipt was stored
+                // but before the pending marker was removed. Return that
+                // receipt without downgrading it or signing/paying again.
+                if let Some(bytes) = host
+                    .store_get(&topup_store_key(wallet), crate::MAX_STORED)
+                    .map_err(common::backend)?
+                    && let Ok(receipt) = serde_json::from_slice::<crate::StoredTopUp>(&bytes)
+                    && receipt.status == "completed"
+                    && receipt.authorization_nonce.as_deref()
+                        == Some(pending.prepared.authorization.nonce.as_str())
+                    && receipt
+                        .address
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(address))
+                    && receipt.wallet == wallet
+                    && receipt.amount_base_units == amount_base_units_str
+                {
+                    host.store_del(&pending_key).map_err(common::backend)?;
+                    return Ok((receipt.amount_base_units, receipt.balance_usd));
+                }
+                record_uncertain_topup(host, &pending)?;
+                return Err(uncertain_topup());
+            }
             let valid_before = pending
                 .prepared
                 .authorization
@@ -225,14 +284,6 @@ pub(crate) fn top_up<H: Host>(
                     now_secs,
                 )?
             } else {
-                if pending.wallet != wallet
-                    || !pending.address.eq_ignore_ascii_case(address)
-                    || pending.amount_base_units != amount_base_units_str
-                {
-                    return Err(common::invalid(
-                        "a different top-up is already awaiting completion for this wallet",
-                    ));
-                }
                 pending
             }
         }
@@ -298,25 +349,46 @@ pub(crate) fn top_up<H: Host>(
         body: serde_json::to_vec(&json!({}))
             .map_err(|e| common::backend(format!("serialize retry body: {e}")))?,
     };
+    // Commit before transport. A crash, timeout, non-2xx or malformed reply
+    // cannot establish whether the facilitator already consumed this nonce.
+    pending.payment_attempted = Some(true);
+    let bytes = serde_json::to_vec(&pending)
+        .map_err(|_| common::backend("serialize payment submission state"))?;
+    host.store_put(&pending_key, &bytes, false)
+        .map_err(common::backend)?;
+    record_uncertain_topup(host, &pending)?;
     let retry_response = host
         .http_fetch(&retry_request, MAX_BODY)
-        .map_err(common::backend)?;
+        .map_err(|_| uncertain_topup())?;
 
     if !(200..300).contains(&retry_response.status) {
-        let body = common::parse_json_body(&retry_response).unwrap_or(Value::Null);
-        return Err(common::backend(format!(
-            "Venice top-up payment failed: HTTP {}: {}",
-            retry_response.status,
-            common::compact(&body)
-        )));
+        // Payment errors can echo the replayable header. Keep provider bodies
+        // out of agent-visible errors, and preserve the unknown outcome.
+        return Err(uncertain_topup());
     }
 
-    let result = common::parse_json_body(&retry_response).map_err(common::backend)?;
+    let result = common::parse_json_body(&retry_response).map_err(|_| uncertain_topup())?;
     // Venice's canonical client reads `data.newBalance` (number); some response
     // shapes use a top-level `balanceUsd` string. Accept either so the recorded
     // balance reflects reality regardless of the exact envelope.
-    let balance_usd =
-        field_string(&result, "balanceUsd").or_else(|| field_string(&result, "newBalance"));
+    let balance_usd = field_string(&result, "balanceUsd")
+        .or_else(|| field_string(&result, "newBalance"))
+        .filter(|amount| common::parse_usd_to_base_units(amount).is_ok());
+    // Persist the receipt before clearing the recovery marker.
+    let stored = crate::types::StoredTopUp {
+        wallet: wallet.into(),
+        address: Some(address.into()),
+        authorization_nonce: Some(pending.prepared.authorization.nonce.clone()),
+        amount_usd: amount_usd.into(),
+        amount_base_units: amount_base_units_str.clone(),
+        status: "completed".into(),
+        created_ms: now_ms,
+        balance_usd: balance_usd.clone(),
+    };
+    let bytes =
+        serde_json::to_vec(&stored).map_err(|_| common::backend("serialize top-up result"))?;
+    host.store_put(&topup_store_key(wallet), &bytes, false)
+        .map_err(common::backend)?;
     host.store_del(&pending_key).map_err(common::backend)?;
 
     Ok((amount_base_units_str, balance_usd))
@@ -383,6 +455,7 @@ fn prepare_top_up<H: Host>(
         prepared,
         approval_action_id: None,
         approval_expires_ms: None,
+        payment_attempted: Some(false),
     })
 }
 
@@ -791,6 +864,190 @@ mod tests {
     // wiring of the payment + chat paths after the amount-semantics, SIWE
     // URI-binding, system_prompt, and x402 wire-format fixes.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn lost_payment_response_cannot_refresh_or_repeat_after_expiry() {
+        for reply in [
+            Err("lost response containing replayable-header".into()),
+            Ok(HttpResponse {
+                status: 500,
+                headers: vec![],
+                body: b"replayable-header".to_vec(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: b"not-json".to_vec(),
+            }),
+        ] {
+            let mut host = payment_ready_host(Some(false));
+            host.sign_results.push_back(Ok(signature()));
+            host.http_results.push_back(reply);
+            let error = top_up(&mut host, "wallet", ADDRESS, "10.00").unwrap_err();
+            let DispatchResponse::Error { message, .. } = error else {
+                panic!("expected error")
+            };
+            assert!(message.contains("unknown"));
+            assert!(!message.contains("replayable-header"));
+            let key = "state/topups/wallet.pending.json";
+            let committed: PendingTopUp =
+                serde_json::from_slice(&host.stores_at_http[0][key]).unwrap();
+            assert_eq!(
+                committed.payment_attempted,
+                Some(true),
+                "marker must be durable before transport"
+            );
+            let retained: PendingTopUp = serde_json::from_slice(&host.store[key]).unwrap();
+            assert_eq!(retained.payment_attempted, Some(true));
+            let nonce = retained.prepared.authorization.nonce.clone();
+            for elapsed in [280_000, 600_000] {
+                host.now_ms = 1_700_000_000_000 + elapsed;
+                assert!(top_up(&mut host, "wallet", ADDRESS, "10.00").is_err());
+            }
+            assert!(top_up(&mut host, "wallet", ADDRESS, "11.00").is_err());
+            assert_eq!(host.sign_requests.len(), 1);
+            assert_eq!(host.requests.len(), 1);
+            let still: PendingTopUp = serde_json::from_slice(&host.store[key]).unwrap();
+            assert_eq!(still.prepared.authorization.nonce, nonce);
+            let view: Value =
+                serde_json::from_slice(&host.store[&topup_store_key("wallet")]).unwrap();
+            assert_eq!(view["status"], "submission_unknown");
+            assert_eq!(view["authorization_nonce"], nonce);
+            assert!(!common::compact(&view).contains("signature"));
+        }
+    }
+
+    fn payment_ready_host(attempted: Option<bool>) -> MockHost {
+        let mut host = MockHost {
+            now_ms: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let requirement = x402::PaymentRequirement {
+            scheme: "exact".into(),
+            network: "base".into(),
+            asset: common::USDC_BASE.into(),
+            amount: "5000000".into(),
+            pay_to: "0x2670b922ef37c7df47158725c0cc407b5382293f".into(),
+            max_timeout_seconds: 300,
+            extra: json!({"name":"USD Coin","version":"2"}),
+        };
+        let now = host.now_ms / 1000;
+        let prepared =
+            x402::prepare_payment(&mut host, ADDRESS, &requirement, "10000000", 2, now).unwrap();
+        let pending = PendingTopUp {
+            wallet: "wallet".into(),
+            address: ADDRESS.into(),
+            amount_base_units: "10000000".into(),
+            prepared,
+            approval_action_id: None,
+            approval_expires_ms: None,
+            payment_attempted: attempted,
+        };
+        host.store.insert(
+            "state/topups/wallet.pending.json".into(),
+            serde_json::to_vec(&pending).unwrap(),
+        );
+        host
+    }
+
+    #[test]
+    fn legacy_pending_payment_is_unknown_even_without_submission_marker() {
+        let mut host = payment_ready_host(None);
+        let key = "state/topups/wallet.pending.json";
+        let mut legacy: Value = serde_json::from_slice(&host.store[key]).unwrap();
+        legacy.as_object_mut().unwrap().remove("payment_attempted");
+        host.store
+            .insert(key.into(), serde_json::to_vec(&legacy).unwrap());
+        host.now_ms += 600_000;
+        assert!(top_up(&mut host, "wallet", ADDRESS, "10.00").is_err());
+        assert!(host.sign_requests.is_empty());
+        assert!(host.requests.is_empty());
+        assert!(host.store.contains_key(key));
+    }
+
+    #[test]
+    fn payment_receipt_does_not_persist_an_echoed_header_as_balance() {
+        let mut host = payment_ready_host(Some(false));
+        host.sign_results.push_back(Ok(signature()));
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: br#"{"balanceUsd":"replayable-payment-header"}"#.to_vec(),
+        }));
+        let (_, balance) = top_up(&mut host, "wallet", ADDRESS, "10.00").unwrap();
+        assert!(balance.is_none());
+        let bytes = &host.store[&topup_store_key("wallet")];
+        assert!(
+            !std::str::from_utf8(bytes)
+                .unwrap()
+                .contains("replayable-payment-header")
+        );
+    }
+
+    #[test]
+    fn committed_receipt_survives_a_crash_before_pending_cleanup() {
+        for matching in [true, false] {
+            let mut host = payment_ready_host(Some(true));
+            let key = "state/topups/wallet.pending.json";
+            let pending: PendingTopUp = serde_json::from_slice(&host.store[key]).unwrap();
+            let nonce = if matching {
+                pending.prepared.authorization.nonce
+            } else {
+                "0xwrong-nonce".into()
+            };
+            host.store.insert(
+                topup_store_key("wallet"),
+                serde_json::to_vec(&json!({
+                    "wallet":"wallet","address":ADDRESS,"authorization_nonce":nonce,
+                    "status":"completed","amount_usd":"10.00","amount_base_units":"10000000",
+                    "created_ms":host.now_ms,"balance_usd":"15.00"
+                }))
+                .unwrap(),
+            );
+            let result = top_up(&mut host, "wallet", ADDRESS, "10.00");
+            assert_eq!(result.is_ok(), matching);
+            assert!(host.requests.is_empty());
+            assert!(host.sign_requests.is_empty());
+            if matching {
+                assert_eq!(result.unwrap().1.as_deref(), Some("15.00"));
+                assert!(!host.store.contains_key(key));
+                let value: Value =
+                    serde_json::from_slice(&host.store[&topup_store_key("wallet")]).unwrap();
+                assert_eq!(value["status"], "completed");
+            } else {
+                assert!(host.store.contains_key(key));
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_unsubmitted_payment_can_refresh_after_expiry() {
+        let mut host = payment_ready_host(Some(false));
+        let old: PendingTopUp =
+            serde_json::from_slice(&host.store["state/topups/wallet.pending.json"]).unwrap();
+        host.now_ms += 600_000;
+        host.random_data.push_back(vec![3; 32]);
+        host.sign_results.push_back(Ok(signature()));
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 402,
+            headers: vec![],
+            body: serde_json::to_vec(&json!({
+            "x402Version":2,"accepts":[old.prepared.requirement]}))
+            .unwrap(),
+        }));
+        host.http_results.push_back(Ok(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: br#"{"balanceUsd":"15"}"#.to_vec(),
+        }));
+        top_up(&mut host, "wallet", ADDRESS, "10.00").unwrap();
+        assert_eq!(host.requests.len(), 2);
+        assert_eq!(host.sign_requests.len(), 1);
+        let stored: crate::StoredTopUp =
+            serde_json::from_slice(&host.store[&topup_store_key("wallet")]).unwrap();
+        assert_eq!(stored.status, "completed");
+        assert!(!host.store.contains_key("state/topups/wallet.pending.json"));
+    }
 
     #[test]
     fn top_up_full_flow_pays_caller_amount_and_records_balance() {
