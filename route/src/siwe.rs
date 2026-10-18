@@ -355,7 +355,9 @@ fn session_key(wallet: &str, resource_url: &str) -> String {
     let mut hasher = Keccak256::new();
     hasher.update(resource_url.as_bytes());
     let slug = hex::encode(&hasher.finalize()[..8]);
-    format!("venice-x402/sessions/{wallet}/{slug}")
+    // The pinned SDK reads/deletes from secrets only for `creds/` keys.
+    // A secret write under another prefix cannot be read back on retry.
+    format!("creds/venice-x402/sessions/{wallet}/{slug}")
 }
 
 fn pending_session_key(wallet: &str, resource_url: &str) -> String {
@@ -521,6 +523,11 @@ mod tests {
             host.sign_requests[0].preimage
         );
         assert_eq!(host.sign_requests[0].action, host.sign_requests[1].action);
+        assert!(
+            host.store.is_empty(),
+            "login state or signatures escaped into public state"
+        );
+        assert!(!host.secret_store.is_empty());
         assert_eq!(
             host.sign_requests[0].preimage,
             host.sign_requests[1].preimage

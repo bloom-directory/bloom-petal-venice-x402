@@ -31,9 +31,9 @@ route/
 ├── files/
 │   ├── status.json.rs              — Static petal health endpoint
 │   ├── models.json.rs              — Proxy to Venice's public models list
-│   ├── balance/[wallet]/[index].json.rs — Explicit refresh write + cached balance read
-│   ├── topup/[wallet]/[index].json.rs   — Top-up handler (SIWE + EIP-3009 payment)
-│   ├── chat/[wallet]/[index]/[id].json.rs  — Chat completion handler (SIWE auth)
+│   ├── accounts/[wallet]/[index]/balance.json.rs — Explicit refresh write + cached balance read
+│   ├── accounts/[wallet]/[index]/topup.json.rs   — Top-up handler (SIWE + EIP-3009 payment)
+│   ├── accounts/[wallet]/[index]/chat/[id].json.rs  — Chat completion handler (SIWE auth)
 │   └── $index.rs                   — Directory listing
 └── tests/
     └── integration.rs              — 16 public API tests
@@ -57,31 +57,29 @@ Public proxy to Venice's model list. Cached for 60 seconds. No auth required.
 ### `GET /status.json`
 Static health check endpoint. Returns petal name and version.
 
-### `GET /balance/{wallet}/{index}.json`
+### `GET /accounts/{wallet}/{index}/balance.json`
 Reads the last known balance from the state store. The wallet alias is validated as a
 safe path segment and `{index}` as the account number Bloom selected.
 On a fresh install this returns not found until the balance has been refreshed.
 
-### `POST /balance/{wallet}/{index}.json`
+### `POST /accounts/{wallet}/{index}/balance.json`
 Refreshes the cached balance. Write either an empty body or `{}`. The wallet signs
 the `venice-x402.balance` SIWE intent through Bloom's owner-visible approval flow;
 after approval, retry the identical write and then read the route with `GET`.
 
-### `POST /topup/{wallet}/{index}.json`
+### `POST /accounts/{wallet}/{index}/topup.json`
 Initiates an x402 top-up. Requires a signed request with:
 ```json
 {
-  "address": "0x...",
   "amount_usd": "5.00"
 }
 ```
 The wallet signs the `venice-x402.topup` intent. The petal constructs and signs an EIP-3009 payment authorization.
 
-### `POST /chat/{wallet}/{index}/{id}.json`
+### `POST /accounts/{wallet}/{index}/chat/{id}.json`
 Sends a chat completion request. Requires a signed request with:
 ```json
 {
-  "address": "0x...",
   "model": "llama-3.3-70b",
   "messages": [{"role": "user", "content": "Hello!"}],
   "system_prompt": "Be concise.",
@@ -90,7 +88,9 @@ Sends a chat completion request. Requires a signed request with:
   "stream": false
 }
 ```
-The wallet signs the `venice-x402.chat` intent. Results are persisted to `state/venice-x402/chat/{wallet}/{id}`.
+The path selects the account for login and payment. An optional legacy `address`
+field is accepted only when it matches that account. The wallet signs the
+`venice-x402.chat` intent. Results are persisted to `state/venice-x402/chat/{wallet}/{id}`.
 
 ## Capabilities
 

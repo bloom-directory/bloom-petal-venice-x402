@@ -12,6 +12,17 @@ use serde_json::json;
 
 const ADDRESS: &str = "0x1234567890abcdef1234567890abcdef12345678";
 
+#[test]
+fn path_selected_accounts_do_not_require_a_second_address_in_the_body() {
+    let chat = parse_chat_request(
+        br#"{"model":"fixture","messages":[{"role":"user","content":"hello"}]}"#,
+    )
+    .unwrap();
+    assert!(chat.address.is_empty());
+    let payment = parse_topup_request(br#"{"amount_usd":"5.00"}"#).unwrap();
+    assert!(payment.address.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Chat request validation
 // ---------------------------------------------------------------------------

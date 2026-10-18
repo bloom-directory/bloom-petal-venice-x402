@@ -6,9 +6,9 @@ petal::route_file!(
         "description": "Private AI inference via Venice's x402 payment protocol. Authenticate with SIWE, top up with USDC on Base via EIP-3009, and call Venice inference endpoints.",
         "canonical_routes": {
             "models": "models.json",
-            "balance": "balance/<wallet>/<index>.json",
-            "topup": "topup/<wallet>/<index>.json",
-            "chat": "chat/<wallet>/<index>/<id>.json"
+            "balance": "accounts/<wallet>/<index>/balance.json",
+            "topup": "accounts/<wallet>/<index>/topup.json",
+            "chat": "accounts/<wallet>/<index>/chat/<id>.json"
         },
         "provider": "venice",
         "auth": "siwe-eip4361",

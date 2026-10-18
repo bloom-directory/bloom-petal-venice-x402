@@ -27,7 +27,7 @@ errors and a stale `petal-build.toml`. CI runs all five on every PR.
 
 4. **`lib.rs` is the only place that constructs `BloomHost`** and calls `petal::sdk` directly (for `vfs_read`, `read_store`, `read_json_value`).
 
-5. **Secrets never leave the secrets namespace.** SIWE sessions are stored under `venice-x402/sessions/{wallet}` (secret=true). Chat results and balance views go to `state/venice-x402/...` (secret=false).
+5. **Secrets never leave the secrets namespace.** SIWE sessions and pending login state use `creds/venice-x402/sessions/{wallet}/...`, which makes the pinned SDK read, write and delete from secrets. A secret write under another prefix cannot be read back with `store_get`. Chat results and balance views use state storage.
 
 ## Module Responsibilities
 
@@ -64,9 +64,9 @@ Every wallet-scoped route declares adjacent `[wallet]/[index]` captures, and
 the Petal spends from the account the caller named:
 
 ```
-balance/<wallet>/<index>.json
-topup/<wallet>/<index>.json
-chat/<wallet>/<index>/<id>.json
+accounts/<wallet>/<index>/balance.json
+accounts/<wallet>/<index>/topup.json
+accounts/<wallet>/<index>/chat/<id>.json
 ```
 
 bloom#328 refuses a wallet-scoped route that names `[wallet]` alone, so there

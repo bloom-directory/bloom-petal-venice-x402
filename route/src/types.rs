@@ -3,11 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Write body for `POST /petals/venice-x402/chat/<wallet>/<id>.json`.
+/// Write body for `POST /petals/venice-x402/accounts/<wallet>/<index>/chat/<id>.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {
-    /// EVM address of the wallet (used for SIWE + payment).
+    /// Optional legacy assertion; must match the path-selected account.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub address: String,
     /// Venice model identifier (e.g. `"kimi-k2-5"`).
     pub model: String,
@@ -67,11 +68,12 @@ pub struct TokenUsage {
     pub total_tokens: Option<u64>,
 }
 
-/// Write body for `POST /petals/venice-x402/topup/<wallet>.json`.
+/// Write body for `POST /petals/venice-x402/accounts/<wallet>/<index>/topup.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopUpRequest {
-    /// EVM address of the wallet.
+    /// Optional legacy assertion; must match the path-selected account.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub address: String,
     /// Amount to top up in USD (e.g. `"5.00"`). Converted to USDC base units.
     pub amount_usd: String,
@@ -94,7 +96,7 @@ pub struct StoredTopUp {
     pub balance_usd: Option<String>,
 }
 
-/// Balance view returned at `GET /petals/venice-x402/balance/<wallet>.json`.
+/// Balance view returned at `GET /petals/venice-x402/accounts/<wallet>/<index>/balance.json`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BalanceView {
     pub wallet: String,

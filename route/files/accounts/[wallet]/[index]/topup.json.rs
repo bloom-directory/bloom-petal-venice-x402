@@ -25,9 +25,9 @@ petal::route_file!(
             Ok(address) => address,
             Err(response) => return response,
         };
-        let request: crate::TopUpRequest = match crate::serde_json::from_slice(body) {
+        let request = match crate::parse_topup_request(body) {
             Ok(request) => request,
-            Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
+            Err(response) => return response,
         };
         if !crate::is_evm_address(&request.address) {
             return petal::error(-3, "address must be a valid EVM address");

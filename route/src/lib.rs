@@ -103,6 +103,10 @@ pub fn venice_chat(
 ) -> petal::DispatchResponse {
     use common::Host;
 
+    if !request.address.is_empty() && !request.address.eq_ignore_ascii_case(address) {
+        return common::invalid("body address differs from the path-selected account");
+    }
+
     let mut host = match common::BloomHost::new(ctx) {
         Ok(host) => host,
         Err(response) => return response,
@@ -153,6 +157,10 @@ pub fn venice_topup(
     request: TopUpRequest,
 ) -> petal::DispatchResponse {
     use common::Host;
+
+    if !request.address.is_empty() && !request.address.eq_ignore_ascii_case(address) {
+        return common::invalid("body address differs from the path-selected account");
+    }
 
     let mut host = match common::BloomHost::new(ctx) {
         Ok(host) => host,

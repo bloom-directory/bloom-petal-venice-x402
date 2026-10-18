@@ -476,10 +476,7 @@ pub fn parse_chat_request(body: &[u8]) -> Result<ChatRequest, DispatchResponse> 
     }
     let request: ChatRequest = serde_json::from_slice(body)
         .map_err(|e| common::invalid(format!("invalid request JSON: {e}")))?;
-    if request.address.is_empty() {
-        return Err(common::invalid("address is required"));
-    }
-    if !common::is_evm_address(&request.address) {
+    if !request.address.is_empty() && !common::is_evm_address(&request.address) {
         return Err(common::invalid(
             "address must be a valid EVM address (0x-prefixed, 40 hex digits)",
         ));
@@ -517,7 +514,7 @@ pub fn parse_topup_request(body: &[u8]) -> Result<crate::types::TopUpRequest, Di
     }
     let request: crate::types::TopUpRequest = serde_json::from_slice(body)
         .map_err(|e| common::invalid(format!("invalid request JSON: {e}")))?;
-    if !common::is_evm_address(&request.address) {
+    if !request.address.is_empty() && !common::is_evm_address(&request.address) {
         return Err(common::invalid(
             "address must be a valid EVM address (0x-prefixed, 40 hex digits)",
         ));

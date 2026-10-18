@@ -45,9 +45,9 @@ petal::route_file!(
             Ok(address) => address,
             Err(response) => return response,
         };
-        let request: crate::ChatRequest = match crate::serde_json::from_slice(body) {
+        let request = match crate::parse_chat_request(body) {
             Ok(request) => request,
-            Err(error) => return petal::error(-3, format!("invalid request JSON: {error}")),
+            Err(response) => return response,
         };
         crate::venice_chat(ctx, &wallet, &address, &id, request)
     },

@@ -373,6 +373,7 @@ pub(crate) mod test_helpers {
     #[derive(Default)]
     pub(crate) struct MockHost {
         pub(crate) store: HashMap<String, Vec<u8>>,
+        pub(crate) secret_store: HashMap<String, Vec<u8>>,
         pub(crate) http_results: VecDeque<Result<HttpResponse, String>>,
         pub(crate) sign_results: VecDeque<Result<SignOutcome, String>>,
         pub(crate) requests: Vec<HttpRequest>,
@@ -383,16 +384,31 @@ pub(crate) mod test_helpers {
 
     impl Host for MockHost {
         fn store_get(&mut self, key: &str, _max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
-            Ok(self.store.get(key).cloned())
+            let store = if key == "creds" || key.starts_with("creds/") {
+                &self.secret_store
+            } else {
+                &self.store
+            };
+            Ok(store.get(key).cloned())
         }
 
-        fn store_put(&mut self, key: &str, value: &[u8], _secret: bool) -> Result<(), String> {
-            self.store.insert(key.into(), value.to_vec());
+        fn store_put(&mut self, key: &str, value: &[u8], secret: bool) -> Result<(), String> {
+            let store = if secret || key == "creds" || key.starts_with("creds/") {
+                &mut self.secret_store
+            } else {
+                &mut self.store
+            };
+            store.insert(key.into(), value.to_vec());
             Ok(())
         }
 
         fn store_del(&mut self, key: &str) -> Result<(), String> {
-            self.store.remove(key);
+            let store = if key == "creds" || key.starts_with("creds/") {
+                &mut self.secret_store
+            } else {
+                &mut self.store
+            };
+            store.remove(key);
             Ok(())
         }
 
