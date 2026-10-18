@@ -18,9 +18,9 @@ methods = ["get", "post"]
 paths = [
     "/api/v1/models",
     "/api/v1/chat/completions",
-    "/api/v1/x402/balance",
+    "/api/v1/x402/balance/*",
     "/api/v1/x402/top-up",
-    "/api/v1/x402/transactions",
+    "/api/v1/x402/transactions/*",
 ]
 
 [sign]

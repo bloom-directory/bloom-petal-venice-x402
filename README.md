@@ -43,7 +43,7 @@ route/
 
 - **Host trait abstraction**: All I/O (store, HTTP, signing, time, randomness) goes through the `Host` trait in `common.rs`. Production uses `BloomHost`; tests inject `MockHost`. This makes the entire business logic unit-testable without network access.
 
-- **Session caching**: SIWE sessions are cached in the secrets store with a 270-second renewal threshold (5-minute lifetime). Sessions survive across route dispatches.
+- **Login approvals**: A pending login keeps its exact message and nonce through approval retries. Signed proofs stay in secret storage and are consumed before an HTTP attempt. Each later request gets a fresh nonce and approval; Venice rejects proof replay. No signature is published in route state.
 
 - **No API keys**: Authentication is purely cryptographic — the wallet signs messages and payments. No Venice API key or secret is stored.
 

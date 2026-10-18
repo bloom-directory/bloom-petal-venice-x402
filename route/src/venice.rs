@@ -43,6 +43,7 @@ fn authed_get<H: Host>(
         ],
         body: Vec::new(),
     };
+    siwe::consume_session(host, wallet, &request.url)?;
     let response = host
         .http_fetch(&request, MAX_BODY)
         .map_err(common::backend)?;
@@ -439,6 +440,7 @@ pub(crate) fn chat_completion_raw<H: Host>(
         body: body_bytes,
     };
 
+    siwe::consume_session(host, wallet, &http_request.url)?;
     let response = host
         .http_fetch(&http_request, MAX_BODY)
         .map_err(common::backend)?;

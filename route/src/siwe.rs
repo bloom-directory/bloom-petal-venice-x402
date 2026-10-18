@@ -198,7 +198,9 @@ pub(crate) fn get_or_create_session(
     let key = session_key(wallet, resource_url);
 
     // Try to load and validate an existing session.
-    if let Some(session) = load_cached_session(host, &key)? {
+    if let Some(session) = load_cached_session(host, &key)?
+        && session.address.eq_ignore_ascii_case(address)
+    {
         return Ok(session);
     }
 
@@ -364,6 +366,17 @@ fn pending_session_key(wallet: &str, resource_url: &str) -> String {
     format!("{}.pending", session_key(wallet, resource_url))
 }
 
+/// Venice consumes a login nonce on an HTTP attempt. Remove its reusable
+/// header before transport so an uncertain response cannot replay the proof.
+pub(crate) fn consume_session(
+    host: &mut impl Host,
+    wallet: &str,
+    resource_url: &str,
+) -> Result<(), DispatchResponse> {
+    host.store_del(&session_key(wallet, resource_url))
+        .map_err(common::backend)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +504,29 @@ mod tests {
             get_or_create_session(&mut host, wallet, address, url, "venice-x402.chat").unwrap();
         assert_eq!(session2.header_b64, session.header_b64);
         assert_eq!(host.sign_requests.len(), 1);
+    }
+
+    #[test]
+    fn an_http_attempt_consumes_its_private_login_proof() {
+        let mut host = MockHost {
+            now_ms: 1_000_000,
+            ..Default::default()
+        };
+        host.random_data.push_back(vec![1; 32]);
+        host.random_data.push_back(vec![2; 32]);
+        host.sign_results.push_back(Ok(signature()));
+        host.sign_results.push_back(Ok(signature()));
+        let address = "0x1234567890abcdef1234567890abcdef12345678";
+        let url = "https://api.venice.ai/api/v1/chat/completions";
+        let first =
+            get_or_create_session(&mut host, "wallet", address, url, "venice-x402.chat").unwrap();
+        consume_session(&mut host, "wallet", url).unwrap();
+        assert!(host.secret_store.is_empty());
+        assert!(host.store.is_empty());
+        let next =
+            get_or_create_session(&mut host, "wallet", address, url, "venice-x402.chat").unwrap();
+        assert_ne!(first.message, next.message);
+        assert_eq!(host.sign_requests.len(), 2);
     }
 
     #[test]
