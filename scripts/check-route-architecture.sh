@@ -37,6 +37,21 @@ while IFS= read -r -d '' file; do
     fi
 done < <(find "$ROUTE_FILES_DIR" -name '*.rs' -print0)
 
+# Every wallet-scoped route is mounted under <wallet>/<index>, so an advertised
+# path naming a wallet without the account directs callers at a route Bloom
+# refuses before the Petal runs. Catch the drift here rather than in review.
+while IFS= read -r -d '' file; do
+    while IFS= read -r advertised; do
+        case "$advertised" in
+            *'<wallet>/<index>'*) ;;
+            *)
+                echo "ERROR: $file advertises '$advertised' without the account index"
+                VIOLATIONS=$((VIOLATIONS + 1))
+                ;;
+        esac
+    done < <(grep -o '"[^"]*<wallet>[^"]*"' "$file" | tr -d '"')
+done < <(find "$ROUTE_FILES_DIR" -name '*.rs' -print0)
+
 if [ "$VIOLATIONS" -gt 0 ]; then
     echo ""
     echo "Architecture check FAILED: $VIOLATIONS violation(s) found."

@@ -24,7 +24,7 @@ paths = [
 ]
 
 [sign]
-allowed_intents = ["venice-x402.siwe", "venice-x402.topup", "venice-x402.chat"]
+allowed_intents = ["venice-x402.balance", "venice-x402.topup", "venice-x402.chat"]
 
 [store]
 namespaces = ["state"]

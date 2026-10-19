@@ -1,0 +1,30 @@
+petal::route_file!(
+    spec: petal::signing_write_spec("venice-x402.balance").caps(&[
+        "bloom:http",
+        "bloom:store",
+        "bloom:sign",
+        "bloom:vfs.read",
+    ]),
+    read: |ctx: &petal::Ctx| {
+        let (wallet, _index) = match crate::wallet_and_index(ctx) {
+            Ok(captured) => captured,
+            Err(response) => return response,
+        };
+        let key = format!("state/balance/{wallet}.json");
+        petal::read_store(&key, crate::MAX_STORED)
+    },
+    write: |ctx: &petal::Ctx, body: &[u8]| {
+        if !body.is_empty() && body != b"{}" {
+            return petal::error(-3, "balance refresh body must be empty or {}");
+        }
+        let (wallet, index) = match crate::wallet_and_index(ctx) {
+            Ok(captured) => captured,
+            Err(response) => return response,
+        };
+        let address = match crate::wallet_address(&wallet, &index) {
+            Ok(address) => address,
+            Err(response) => return response,
+        };
+        crate::venice_balance(ctx, &wallet, &address)
+    },
+);

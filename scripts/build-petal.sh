@@ -8,14 +8,23 @@
 # `wasm-tools`, and the `petal` CLI (https://github.com/bloom-directory/petal).
 set -euo pipefail
 
-if ! command -v petal >/dev/null 2>&1; then
-  echo "error: 'petal' CLI not found. Install with:" >&2
-  echo "  cargo install --git https://github.com/bloom-directory/petal bloom-petal-cli" >&2
-  exit 1
-fi
 if ! command -v wasm-tools >/dev/null 2>&1; then
   echo "error: 'wasm-tools' not found. Install with: cargo install wasm-tools --locked" >&2
   exit 1
 fi
 
-petal build
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PETAL_REV="2beed2ff344ce2b0c112e07096027e1ae0404007"
+
+if [[ -n "${PETAL_BIN:-}" ]]; then
+  "$PETAL_BIN" build --root "$ROOT"
+else
+  tool_root="$ROOT/target/petal-tool"
+  cargo install \
+    --git https://github.com/bloom-directory/petal \
+    --rev "$PETAL_REV" \
+    --locked \
+    --root "$tool_root" \
+    bloom-petal-cli
+  "$tool_root/bin/petal" build --root "$ROOT"
+fi

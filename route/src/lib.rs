@@ -17,24 +17,85 @@ pub use types::{
 };
 pub use venice::{chat_store_key, parse_chat_request, parse_topup_request, topup_store_key};
 
+/// Capture the wallet and account this request acts for.
+///
+/// bloom#328 requires a wallet-scoped route to declare adjacent
+/// `[wallet]/[index]` captures and refuses one that names `[wallet]` alone, so
+/// the account is chosen by the caller rather than assumed. Both values are
+/// concatenated into a VFS path, so both are validated here: the SDK offers
+/// `wallet_param` but nothing for the index, and an index that is not a plain
+/// number could name another account's leaf. A helper for this belongs in the
+/// SDK rather than in each Petal — bloom-directory/petal#41.
+pub fn wallet_and_index(ctx: &petal::Ctx) -> Result<(String, String), petal::DispatchResponse> {
+    let wallet = petal::param(ctx, "wallet").and_then(|value| {
+        if petal::is_safe_segment(value) && value.len() <= 128 {
+            Ok(value.to_owned())
+        } else {
+            Err(petal::error(-3, "wallet alias is unsafe"))
+        }
+    })?;
+    let index = petal::param(ctx, "index").and_then(|value| {
+        if is_account_index(value) {
+            Ok(value.to_owned())
+        } else {
+            Err(petal::error(
+                -3,
+                "account index must be a decimal account number, such as 0 or 1",
+            ))
+        }
+    })?;
+    Ok((wallet, index))
+}
+
+/// Whether `value` spells an account number Bloom would serve.
+///
+/// Decimal, no sign, no leading zero: `01` and `1` would otherwise be two
+/// spellings of one account and only one of them is a path that exists.
+fn is_account_index(value: &str) -> bool {
+    value
+        .parse::<u32>()
+        .is_ok_and(|number| number.to_string() == value)
+}
+
+/// Where a wallet account's EVM address lives in the VFS.
+fn wallet_address_path(wallet: &str, index: &str) -> String {
+    format!("wallets/{wallet}/{index}/address.evm")
+}
+
 /// Resolve a wallet alias to its EVM address via VFS.
-pub fn wallet_address(wallet: &str) -> Result<String, petal::DispatchResponse> {
-    let path = format!("wallets/{wallet}/address");
-    let bytes =
-        petal::sdk::vfs_read(&path, 128).map_err(|error| petal::error(-4, error.message()))?;
+///
+/// The address lives at `wallets/<w>/<n>/address.evm`. bloom#282 moved it
+/// there from `wallets/<w>/address` and deliberately kept no alias, so the
+/// old path now fails as a bare `invalid` with nothing naming what was
+/// missing — hence the errors below name the path they tried.
+pub fn wallet_address(wallet: &str, index: &str) -> Result<String, petal::DispatchResponse> {
+    let path = wallet_address_path(wallet, index);
+    let bytes = petal::sdk::vfs_read(&path, 128).map_err(|error| {
+        petal::error(
+            -4,
+            format!(
+                "cannot read {path}: {}. The wallet must exist and account {index} must hold an EVM key.",
+                error.message()
+            ),
+        )
+    })?;
     let address = core::str::from_utf8(&bytes)
-        .map_err(|_| petal::error(-4, "wallet address is not UTF-8"))?
+        .map_err(|_| petal::error(-4, format!("{path} is not UTF-8")))?
         .trim();
     let lower = address.to_ascii_lowercase();
     if common::is_evm_address(&lower) {
         Ok(lower)
     } else {
-        Err(petal::error(-4, "wallet must be a 20-byte EVM address"))
+        Err(petal::error(
+            -4,
+            format!("{path} did not contain a 20-byte EVM address"),
+        ))
     }
 }
 
 /// Execute a chat completion request and persist the result.
 pub fn venice_chat(
+    ctx: &petal::Ctx,
     wallet: &str,
     address: &str,
     chat_id: &str,
@@ -42,7 +103,10 @@ pub fn venice_chat(
 ) -> petal::DispatchResponse {
     use common::Host;
 
-    let mut host = common::BloomHost;
+    let mut host = match common::BloomHost::new(ctx) {
+        Ok(host) => host,
+        Err(response) => return response,
+    };
     let (value, balance_remaining) =
         match venice::chat_completion_raw(&mut host, wallet, address, &request) {
             Ok(result) => result,
@@ -74,14 +138,26 @@ pub fn venice_chat(
         return common::backend(e);
     }
 
-    petal::read_store(&key, common::MAX_STORED)
+    // A write answers with a write; the result is read back with a GET on
+    // this same route. Returning the stored body from a write makes the
+    // Machine reject it as `write returned non-write response` *after* the
+    // work has already been done.
+    petal::DispatchResponse::Write
 }
 
 /// Execute an x402 top-up and persist the result.
-pub fn venice_topup(wallet: &str, address: &str, request: TopUpRequest) -> petal::DispatchResponse {
+pub fn venice_topup(
+    ctx: &petal::Ctx,
+    wallet: &str,
+    address: &str,
+    request: TopUpRequest,
+) -> petal::DispatchResponse {
     use common::Host;
 
-    let mut host = common::BloomHost;
+    let mut host = match common::BloomHost::new(ctx) {
+        Ok(host) => host,
+        Err(response) => return response,
+    };
     let (amount_base_units, balance_usd) =
         match venice::top_up(&mut host, wallet, address, &request.amount_usd) {
             Ok(result) => result,
@@ -108,23 +184,103 @@ pub fn venice_topup(wallet: &str, address: &str, request: TopUpRequest) -> petal
         return common::backend(e);
     }
 
-    petal::read_store(&key, common::MAX_STORED)
+    // A write answers with a write. Returning the stored body here made the
+    // Machine reject a *settled* top-up as `write returned non-write
+    // response`, so a completed payment reported failure and invited the
+    // caller to pay a second time. The result is read back with a GET.
+    petal::DispatchResponse::Write
 }
 
 /// Fetch balance view for the wallet.
-pub fn venice_balance(wallet: &str, address: &str) -> petal::DispatchResponse {
-    let mut host = common::BloomHost;
+pub fn venice_balance(ctx: &petal::Ctx, wallet: &str, address: &str) -> petal::DispatchResponse {
+    use common::Host;
+
+    let mut host = match common::BloomHost::new(ctx) {
+        Ok(host) => host,
+        Err(response) => return response,
+    };
     match venice::check_balance(&mut host, wallet, address) {
-        Ok(view) => petal::read_json_value(&view),
+        Ok(view) => {
+            let key = format!("state/balance/{wallet}.json");
+            let bytes = match serde_json::to_vec_pretty(&view) {
+                Ok(bytes) => bytes,
+                Err(error) => return common::backend(format!("serialize balance: {error}")),
+            };
+            if let Err(error) = host.store_put(&key, &bytes, false) {
+                return common::backend(error);
+            }
+            // As above: a write answers with a write, and the refreshed
+            // view is read back with a GET.
+            petal::DispatchResponse::Write
+        }
         Err(response) => response,
     }
 }
 
 /// Fetch Venice models list (no auth required).
 pub fn venice_models() -> petal::DispatchResponse {
-    let mut host = common::BloomHost;
+    let mut host = common::BloomHost {
+        package_hash: String::new(),
+        route_id: String::new(),
+    };
     match venice::list_models(&mut host) {
         Ok(value) => petal::read_json_value(&value),
         Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod wallet_path_tests {
+    use super::*;
+
+    #[test]
+    fn the_address_comes_from_the_account_layout_not_the_wallet_root() {
+        // bloom#282 moved this leaf and kept no alias. Reading the old
+        // `wallets/<w>/address` fails as a bare `invalid`, which is how every
+        // wallet action in this Petal broke; pin the current path so a
+        // revert is caught here rather than on a triad.
+        assert_eq!(
+            wallet_address_path("main", "0"),
+            "wallets/main/0/address.evm"
+        );
+        assert_eq!(
+            wallet_address_path("main", "3"),
+            "wallets/main/3/address.evm"
+        );
+        // Assert the account segment is present, rather than that the path
+        // does not end in "/address" -- which it never could, once the suffix
+        // is ".evm", so that assertion could not have failed.
+        assert!(!wallet_address_path("main", "0").starts_with("wallets/main/address"));
+    }
+
+    #[test]
+    fn an_account_index_must_be_a_plain_account_number() {
+        // The index is concatenated into a VFS path, so anything that is not
+        // a decimal number could name another account's leaf. Leading zeros
+        // are refused too: `01` and `1` would be the same account under two
+        // spellings, and only one of them is a path Bloom serves.
+        for ok in ["0", "1", "12", "4294967295"] {
+            assert!(is_account_index(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "01",
+            "-1",
+            "+1",
+            "1.0",
+            "0x1",
+            "1/0",
+            "..",
+            "1 ",
+            " 1",
+            "one",
+            "٣",
+            // A u32 is what Bloom's derivation paths carry, so a larger number
+            // names no account and must not reach a VFS path.
+            "4294967296",
+            "9999999999",
+        ] {
+            assert!(!is_account_index(bad), "{bad:?}");
+        }
     }
 }
